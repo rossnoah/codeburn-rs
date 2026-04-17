@@ -42,7 +42,7 @@ pub struct Cli {
 pub enum Commands {
     /// Interactive usage dashboard (default when no subcommand given)
     Report {
-        /// Starting period: today, week, 30days, month
+        /// Starting period: today, week, 30days, month, all
         #[arg(short, long, default_value = "week")]
         period: Period,
 
@@ -137,6 +137,7 @@ pub enum Period {
     #[value(name = "30days")]
     ThirtyDays,
     Month,
+    All,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

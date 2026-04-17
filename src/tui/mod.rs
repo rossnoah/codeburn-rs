@@ -51,6 +51,7 @@ const PERIODS: &[(&str, &str)] = &[
     ("week", "7 Days"),
     ("30days", "30 Days"),
     ("month", "This Month"),
+    ("all", "All Time"),
 ];
 
 fn period_to_index(p: &str) -> usize {
@@ -59,6 +60,7 @@ fn period_to_index(p: &str) -> usize {
         "week" => 1,
         "30days" => 2,
         "month" => 3,
+        "all" => 4,
         _ => 1,
     }
 }
@@ -69,6 +71,7 @@ fn period_str(p: Period) -> &'static str {
         Period::Week => "week",
         Period::ThirtyDays => "30days",
         Period::Month => "month",
+        Period::All => "all",
     }
 }
 
@@ -153,7 +156,10 @@ where
     Ok(())
 }
 
-pub fn get_date_range(period: &str) -> DateRange {
+pub fn get_date_range(period: &str) -> Option<DateRange> {
+    if period == "all" {
+        return None;
+    }
     let now = Local::now();
     let today_start = now
         .date_naive()
@@ -196,7 +202,7 @@ pub fn get_date_range(period: &str) -> DateRange {
             .unwrap(),
     };
 
-    DateRange { start, end }
+    Some(DateRange { start, end })
 }
 
 pub struct App {
@@ -323,7 +329,7 @@ impl App {
         let tx = tx.clone();
         std::thread::spawn(move || {
             let projects = parse_all_sessions(
-                Some(&date_range),
+                date_range.as_ref(),
                 filter.as_deref(),
                 &HashMap::new(),
             )
@@ -481,7 +487,7 @@ pub fn run(period: Period, provider: &str, refresh: Option<u64>) -> Result<()> {
         let tx2 = tx.clone();
         std::thread::spawn(move || {
             let projects = parse_all_sessions(
-                Some(&date_range),
+                date_range.as_ref(),
                 filter.as_deref(),
                 &HashMap::new(),
             )
@@ -631,6 +637,12 @@ pub fn run(period: Period, provider: &str, refresh: Option<u64>) -> Result<()> {
                         KeyCode::Char('4') => {
                             if app.period_idx != 3 {
                                 app.period_idx = 3;
+                                app.switch_to(&tx);
+                            }
+                        }
+                        KeyCode::Char('5') => {
+                            if app.period_idx != 4 {
+                                app.period_idx = 4;
                                 app.switch_to(&tx);
                             }
                         }
@@ -789,7 +801,7 @@ fn run_render_once(period: Period, provider: &str) -> Result<()> {
 
         let date_range = get_date_range(period_str(period));
         let filter = if provider == "all" { None } else { Some(provider) };
-        app.projects = crate::parser::parse_all_sessions(Some(&date_range), filter, pre_stats)
+        app.projects = crate::parser::parse_all_sessions(date_range.as_ref(), filter, pre_stats)
             .unwrap_or_default();
         app.loading = false;
 
@@ -904,7 +916,7 @@ pub fn run_static_sync(period: Period, provider: &str) -> Result<()> {
         // orthogonal to this cleanup.
         let date_range = get_date_range(period_str(period));
         let filter = if provider == "all" { None } else { Some(provider) };
-        let agg = parse_all_sessions_static(Some(&date_range), filter).unwrap_or_default();
+        let agg = parse_all_sessions_static(date_range.as_ref(), filter).unwrap_or_default();
 
         let mut buf: Vec<u8> = Vec::with_capacity(1024);
         render_static_aggregate_into(&mut buf, period, &agg);
@@ -959,7 +971,7 @@ fn run_static(period: Period, provider: &str) -> Result<()> {
     } else {
         Some(provider)
     };
-    let projects = parse_all_sessions(Some(&date_range), filter, &HashMap::new())
+    let projects = parse_all_sessions(date_range.as_ref(), filter, &HashMap::new())
         .unwrap_or_default();
     render_static(period, &projects);
     Ok(())

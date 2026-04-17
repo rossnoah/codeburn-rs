@@ -140,15 +140,15 @@ pub async fn run_export(format: ExportFormat, output: Option<String>, provider: 
     let periods = vec![
         PeriodExport {
             label: "Today".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("today")), pf, &empty_prestats)?,
+            projects: parse_all_sessions(get_date_range("today").as_ref(), pf, &empty_prestats)?,
         },
         PeriodExport {
             label: "7 Days".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("week")), pf, &empty_prestats)?,
+            projects: parse_all_sessions(get_date_range("week").as_ref(), pf, &empty_prestats)?,
         },
         PeriodExport {
             label: "30 Days".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("30days")), pf, &empty_prestats)?,
+            projects: parse_all_sessions(get_date_range("30days").as_ref(), pf, &empty_prestats)?,
         },
     ];
 

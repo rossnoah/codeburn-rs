@@ -59,6 +59,7 @@ pub fn render_status_bar(buf: &mut Buffer, area: Rect) {
         kb("2"),  lbl(" week   "),
         kb("3"),  lbl(" 30 days   "),
         kb("4"),  lbl(" month   "),
+        kb("5"),  lbl(" all   "),
         kb("p"),  lbl(" provider"),
     ]);
     let block = Block::default()
