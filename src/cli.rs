@@ -36,6 +36,11 @@ pub struct Cli {
     /// full parse pipeline without the output replay short-circuit.
     #[arg(long, global = true)]
     pub no_output_cache: bool,
+
+    /// Render the real usage data, but replace every project path with a
+    /// stable fake name. Useful for screenshots and demos.
+    #[arg(long, global = true)]
+    pub demo: bool,
 }
 
 #[derive(Subcommand)]

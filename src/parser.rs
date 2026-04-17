@@ -59,8 +59,61 @@ pub fn is_output_cache_bypassed() -> bool {
     OUTPUT_CACHE_BYPASS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// `--demo` mode: keep the real numbers but rename every project to a
+/// stable fake string before it surfaces in the UI / export.
+static DEMO_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_demo_mode(on: bool) {
+    DEMO_MODE.store(on, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_demo_mode() -> bool {
+    DEMO_MODE.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn unsanitize_path(dir_name: &str) -> String {
     dir_name.replace('-', "/")
+}
+
+/// Stable, plausible-looking fake project names used when `--demo` is on.
+/// The display name is `<base>-<hh>` where `base` is picked by hashing
+/// the real path against this list and `hh` is a 2-char hex disambiguator
+/// from a separate hash bit-mix. ~9000 distinct names, so collisions
+/// between real projects in one report are very rare.
+const DEMO_NAMES: &[&str] = &[
+    "atlas-engine", "nimbus-api", "phoenix-cli", "obsidian-store",
+    "emerald-runner", "comet-parser", "velvet-router", "meridian-graph",
+    "onyx-vault", "harbor-sync", "granite-cache", "copper-stream",
+    "juniper-bot", "meadow-app", "horizon-tools", "twilight-db",
+    "crystal-edge", "ember-spark", "crater-loop", "spectra-ui",
+    "voyager-task", "aurora-feed", "mosaic-grid", "tidewater-job",
+    "riverstone-svc", "lighthouse-pkg", "silverleaf-fmt", "canvas-flow",
+    "prism-codec", "summit-link", "breeze-deploy", "glacier-store",
+    "forge-runtime", "sandstone-app", "thicket-mod",
+];
+
+fn fake_project_name(real: &str) -> String {
+    use std::hash::Hasher;
+    let mut h1 = rustc_hash::FxHasher::default();
+    h1.write(real.as_bytes());
+    let n = h1.finish();
+    // Mix differently for the suffix so name-pick and suffix don't
+    // co-vary; otherwise two paths landing on the same base name would
+    // also collide on the suffix.
+    let suffix_byte = ((n.rotate_left(17) ^ 0x9E37_79B9_7F4A_7C15) & 0xFF) as u8;
+    let base = DEMO_NAMES[(n as usize) % DEMO_NAMES.len()];
+    format!("~/Code/{}-{:02x}", base, suffix_byte)
+}
+
+/// Convert a sanitized provider directory name to the path string the UI
+/// renders. Returns the real path normally; under `--demo` returns a
+/// stable fake name so screenshots don't leak local directory names.
+fn display_project_path(raw: &str) -> String {
+    let real = unsanitize_path(raw);
+    if !is_demo_mode() {
+        return real;
+    }
+    fake_project_name(&real)
 }
 
 /// Compute cache-invalidation metadata for every known source and fold
@@ -742,7 +795,7 @@ fn finalize_projects(
             let total_cost: f64 = sessions.iter().map(|s| s.total_cost_usd).sum();
             let total_calls: u64 = sessions.iter().map(|s| s.api_calls).sum();
             ProjectSummary {
-                project_path: unsanitize_path(&project),
+                project_path: display_project_path(&project),
                 sessions,
                 total_cost_usd: total_cost,
                 total_api_calls: total_calls,
@@ -1024,7 +1077,7 @@ fn aggregate_static_from_summary(
         .into_iter()
         .filter(|(_, a)| a.calls > 0)
         .map(|(p, a)| StaticProjectAggregate {
-            project_path: unsanitize_path(&p),
+            project_path: display_project_path(&p),
             total_cost_usd: a.cost,
             total_api_calls: a.calls,
         })

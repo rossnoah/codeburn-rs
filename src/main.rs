@@ -47,6 +47,7 @@ fn main() -> Result<()> {
 
     parser::set_cache_bypass(cli.no_cache);
     parser::set_output_cache_bypass(cli.no_output_cache);
+    parser::set_demo_mode(cli.demo);
 
     let command = cli.command.unwrap_or(Commands::Report {
         period: Period::Week,

@@ -129,6 +129,14 @@ where
     let bypass = crate::parser::is_cache_bypassed();
     let output_cache_bypass = crate::parser::is_output_cache_bypassed();
 
+    // Keep demo and real outputs on separate cache entries by stealing
+    // the top bit of `extra` for the demo flag.
+    let extra = if crate::parser::is_demo_mode() {
+        extra | (1u64 << 63)
+    } else {
+        extra
+    };
+
     let (pre_stats, session_sig) = if !bypass && !output_cache_bypass {
         crate::parser::stat_all_sources()
     } else {
