@@ -111,6 +111,15 @@ pub fn render_header(buf: &mut Buffer, area: Rect, data: &DashboardData, period_
 /// bordered status bar. Hides the rest of the content to avoid mixing
 /// stale data with the "in-progress" indicator.
 pub fn render_loading(f: &mut Frame, area: Rect, app: &App, periods: &[(&str, &str)]) {
+    render_loading_into(f.buffer_mut(), area, app, periods);
+}
+
+pub fn render_loading_into(
+    buf: &mut Buffer,
+    area: Rect,
+    app: &App,
+    periods: &[(&str, &str)],
+) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(vec![
@@ -121,7 +130,7 @@ pub fn render_loading(f: &mut Frame, area: Rect, app: &App, periods: &[(&str, &s
         ])
         .split(area);
 
-    render_tabs(f.buffer_mut(), chunks[0], app, periods);
+    render_tabs(buf, chunks[0], app, periods);
 
     let period_label = periods.get(app.period_idx).map(|p| p.1).unwrap_or("");
     let loading = vec![
@@ -138,7 +147,7 @@ pub fn render_loading(f: &mut Frame, area: Rect, app: &App, periods: &[(&str, &s
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Style::default().fg(COL_TITLE));
-    Paragraph::new(loading).block(block).render(chunks[1], f.buffer_mut());
+    Paragraph::new(loading).block(block).render(chunks[1], buf);
 
-    render_status_bar(f.buffer_mut(), chunks[3]);
+    render_status_bar(buf, chunks[3]);
 }

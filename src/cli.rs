@@ -29,6 +29,13 @@ pub struct Cli {
     /// Useful after manually editing sessions or debugging parser changes.
     #[arg(long, global = true)]
     pub no_cache: bool,
+
+    /// Skip the per-(period, provider) memoized output cache for the
+    /// non-TTY static report path. Doesn't affect the underlying
+    /// `report-cache.bin` parse cache. Mostly used for benchmarking the
+    /// full parse pipeline without the output replay short-circuit.
+    #[arg(long, global = true)]
+    pub no_output_cache: bool,
 }
 
 #[derive(Subcommand)]

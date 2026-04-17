@@ -29,6 +29,40 @@ use crate::types::ProjectSummary;
 
 use super::App;
 
+/// Compute the dashboard data block used by every panel. Exposed so
+/// the one-shot non-TTY render path (`run_render_once`) can size its
+/// output buffer to the dashboard's natural height before drawing.
+pub fn build_dashboard_data<'a>(
+    projects: &'a [ProjectSummary],
+    period: &str,
+) -> aggregate::DashboardData<'a> {
+    aggregate::build(projects, period)
+}
+
+/// Natural height of the dashboard content (excluding tabs / header /
+/// status bar) for the given width — needed up-front by the one-shot
+/// render so we can allocate a buffer tall enough to skip scrolling.
+pub fn dashboard_natural_height(
+    wide: bool,
+    content_width: u16,
+    bw: u16,
+    data: &aggregate::DashboardData,
+) -> u16 {
+    dashboard::natural_height(wide, content_width, bw, data)
+}
+
+/// Render directly into a Buffer (no Frame, no Terminal). Used by the
+/// non-TTY one-shot path which doesn't have a live terminal to attach
+/// a CrosstermBackend to.
+pub fn render_into_buffer(
+    buf: &mut Buffer,
+    area: Rect,
+    app: &App,
+    periods: &[(&str, &str)],
+) {
+    render_inner(buf, area, &app.projects, app, periods);
+}
+
 pub fn render(
     f: &mut Frame,
     projects: &[ProjectSummary],
@@ -36,12 +70,22 @@ pub fn render(
     periods: &[(&str, &str)],
 ) {
     let area = f.area();
+    render_inner(f.buffer_mut(), area, projects, app, periods);
+}
+
+fn render_inner(
+    buf: &mut Buffer,
+    area: Rect,
+    projects: &[ProjectSummary],
+    app: &App,
+    periods: &[(&str, &str)],
+) {
     let dw = dash_width(area.width);
     let wide = is_wide(dw);
     let bw = bar_width(if wide { dw / 2 - 4 } else { dw - 4 });
 
     if app.loading {
-        chrome::render_loading(f, area, app, periods);
+        chrome::render_loading_into(buf, area, app, periods);
         return;
     }
 
@@ -58,8 +102,8 @@ pub fn render(
         ])
         .split(area);
 
-    chrome::render_tabs(f.buffer_mut(), chunks[0], app, periods);
-    chrome::render_header(f.buffer_mut(), chunks[1], &data, period_label);
+    chrome::render_tabs(buf, chunks[0], app, periods);
+    chrome::render_header(buf, chunks[1], &data, period_label);
 
     // Content: render at natural height. If the terminal is shorter, render
     // into an off-screen buffer and blit a scrolled window into the frame so
@@ -68,17 +112,17 @@ pub fn render(
     let natural_h = dashboard::natural_height(wide, content_area.width, bw, &data);
 
     if natural_h <= content_area.height {
-        render_content(f.buffer_mut(), content_area, bw, wide, &data);
+        render_content(buf, content_area, bw, wide, &data);
         app.last_max_scroll.set(0);
     } else {
         let virtual_area = Rect::new(0, 0, content_area.width, natural_h);
         let mut vbuf = Buffer::empty(virtual_area);
         render_content(&mut vbuf, virtual_area, bw, wide, &data);
-        blit_scrolled(f.buffer_mut(), content_area, &vbuf, natural_h, app.scroll_offset);
+        blit_scrolled(buf, content_area, &vbuf, natural_h, app.scroll_offset);
         app.last_max_scroll.set(natural_h - content_area.height);
     }
 
-    chrome::render_status_bar(f.buffer_mut(), chunks[3]);
+    chrome::render_status_bar(buf, chunks[3]);
 }
 
 fn render_content(

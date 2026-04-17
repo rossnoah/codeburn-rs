@@ -44,6 +44,21 @@ pub fn is_cache_bypassed() -> bool {
     CACHE_BYPASS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Process-wide flag set by --no-output-cache. When set the static report
+/// path skips both reading and writing the per-(period, provider) output
+/// memoization file; the underlying `report-cache.bin` parse cache is
+/// unaffected. Mostly useful for benchmarking the full parse pipeline.
+static OUTPUT_CACHE_BYPASS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_output_cache_bypass(bypass: bool) {
+    OUTPUT_CACHE_BYPASS.store(bypass, std::sync::atomic::Ordering::Release);
+}
+
+pub fn is_output_cache_bypassed() -> bool {
+    OUTPUT_CACHE_BYPASS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 fn unsanitize_path(dir_name: &str) -> String {
     dir_name.replace('-', "/")
 }

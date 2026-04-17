@@ -12,6 +12,8 @@
 #   ./bench.sh --provider cursor    # single provider
 #   ./bench.sh --runs 10 --warmup 3
 #   ./bench.sh --no-js              # skip JS benchmark for fast iteration
+#   ./bench.sh --no-output-cache    # bypass the static-report output cache
+#                                   # (forces every run through the parse pipeline)
 
 set -euo pipefail
 
@@ -34,17 +36,19 @@ WARMUP=2
 MODE="cache"   # "nocache" = wipe cursor disk cache + pass --no-cache
                  # "cache"   = let both sides use their on-disk caches
 NO_JS=0
+NO_OUTPUT_CACHE=0
 EXTRA=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --provider) PROVIDER="$2"; shift 2 ;;
-    --period)   PERIOD="$2";   shift 2 ;;
-    --runs)     RUNS="$2";     shift 2 ;;
-    --warmup)   WARMUP="$2";   shift 2 ;;
-    --mode)     MODE="$2";     shift 2 ;;
-    --no-js)    NO_JS=1;       shift   ;;
-    *)          EXTRA+=("$1"); shift   ;;
+    --provider)        PROVIDER="$2";        shift 2 ;;
+    --period)          PERIOD="$2";          shift 2 ;;
+    --runs)            RUNS="$2";            shift 2 ;;
+    --warmup)          WARMUP="$2";          shift 2 ;;
+    --mode)            MODE="$2";            shift 2 ;;
+    --no-js)           NO_JS=1;              shift   ;;
+    --no-output-cache) NO_OUTPUT_CACHE=1;    shift   ;;
+    *)                 EXTRA+=("$1");        shift   ;;
   esac
 done
 
@@ -53,15 +57,22 @@ if [ "$NO_JS" -eq 0 ] && ! command -v npx >/dev/null; then
   exit 1
 fi
 
+RUST_EXTRA_FLAGS=""
+RUST_LABEL_SUFFIX=""
+if [ "$NO_OUTPUT_CACHE" -eq 1 ]; then
+  RUST_EXTRA_FLAGS="--no-output-cache"
+  RUST_LABEL_SUFFIX=" no-out-cache"
+fi
+
 case "$MODE" in
   nocache)
     # Wipe both sides' cursor result caches before every run so the full
     # SQLite scan actually happens. Rust still gets `--no-cache` so its
     # in-memory LRU in `parse_all_sessions` can't short-circuit either.
-    PREPARE='rm -f ~/.cache/codeburn/cursor-results.json ~/.cache/codeburn/cursor-full-cache.json'
-    RUST_CMD="$RUST_BIN report --no-cache --provider $PROVIDER --period $PERIOD < /dev/null"
-    JS_CMD="npx --yes codeburn report --provider $PROVIDER --period $PERIOD < /dev/null"
-    RUST_LABEL="rust (--no-cache)"
+    PREPARE="rm -f $HOME/.cache/codeburn/cursor-results.json $HOME/.cache/codeburn/cursor-full-cache.json"
+    RUST_CMD="$RUST_BIN report --no-cache $RUST_EXTRA_FLAGS --provider $PROVIDER --period $PERIOD"
+    JS_CMD="npx --yes codeburn report --provider $PROVIDER --period $PERIOD"
+    RUST_LABEL="rust (--no-cache$RUST_LABEL_SUFFIX)"
     JS_LABEL="js  (npx codeburn)"
     ;;
   cache)
@@ -69,9 +80,9 @@ case "$MODE" in
     # measured runs read from them. This is closer to a user's second-and-
     # later invocations of `codeburn report` against unchanged session data.
     PREPARE=""
-    RUST_CMD="$RUST_BIN report --provider $PROVIDER --period $PERIOD < /dev/null"
-    JS_CMD="npx --yes codeburn report --provider $PROVIDER --period $PERIOD < /dev/null"
-    RUST_LABEL="rust (cache on)"
+    RUST_CMD="$RUST_BIN report $RUST_EXTRA_FLAGS --provider $PROVIDER --period $PERIOD"
+    JS_CMD="npx --yes codeburn report --provider $PROVIDER --period $PERIOD"
+    RUST_LABEL="rust (cache on$RUST_LABEL_SUFFIX)"
     JS_LABEL="js  (cache on)"
     ;;
   *)
@@ -87,7 +98,15 @@ if [ "$NO_JS" -eq 0 ]; then
 fi
 echo
 
-HF_ARGS=(--warmup "$WARMUP" --runs "$RUNS")
+# --shell=none avoids the ~1-2 ms `sh -c` startup that hyperfine warns about
+# at sub-5 ms results. --input null fills in for the `< /dev/null` shell
+# redirection we used to inline in the command string.
+#
+# CODEBURN_STATIC_OUTPUT=1 forces the compact text aggregate (the bench's
+# original target) instead of the rich ratatui dashboard that's now the
+# default for non-TTY stdin — keeps cached numbers comparable to historical
+# baselines.
+HF_ARGS=(--shell=none --input null --warmup "$WARMUP" --runs "$RUNS")
 if [ -n "$PREPARE" ]; then
   HF_ARGS+=(--prepare "$PREPARE")
 fi
