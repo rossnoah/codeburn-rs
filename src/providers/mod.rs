@@ -141,7 +141,12 @@ pub fn get_all_providers() -> Vec<Box<dyn Provider>> {
     vec![
         Box::new(claude::ClaudeProvider),
         Box::new(codex::CodexProvider),
-        Box::new(cursor::CursorProvider),
+        // Cursor provider is disabled: Cursor no longer writes per-call token
+        // counts to the local state.vscdb.
+        // `tokenCount.inputTokens`/`outputTokens` = 0, so parsing it would
+        // always report $0. Parser code in `providers::cursor` is kept for
+        // reference and in case the data layout is restored upstream.
+        // Box::new(cursor::CursorProvider),
         Box::new(opencode::OpenCodeProvider),
         Box::new(pi::PiProvider),
         Box::new(copilot::CopilotProvider),
