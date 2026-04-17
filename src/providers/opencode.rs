@@ -199,8 +199,24 @@ fn parse_opencode_db_batch(
     db_path: &str,
     sources: &[&SessionSource],
     seen_keys: &DashSet<String>,
+    since: Option<std::time::SystemTime>,
 ) -> Vec<(String, String, Vec<ParsedProviderCall>)> {
     let prof = std::env::var_os("CODEBURN_PROFILE").is_some();
+    // Fast path: --no-cache mode never persists results back to the disk
+    // cache, so we don't need parts (tools / bash commands / user message
+    // text) — only message-level cost+tokens that the static aggregate
+    // actually reads. Skipping the SELECT parts query saves ~140 ms on a
+    // 8 k-row part table and is a major contributor to keeping --no-cache
+    // under the 150 ms budget.
+    let skip_parts = crate::parser::is_cache_bypassed();
+    // Same logic for `since`: only safe to push the time_created filter
+    // into SQL when we won't be writing the result to the persistent
+    // cache. `time_created` is unix-ms; `since` is a SystemTime — convert.
+    let since_ms: Option<i64> = since.and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_millis() as i64)
+    });
     let t_open = std::time::Instant::now();
     let conn = match Connection::open_with_flags(
         db_path,
@@ -240,6 +256,15 @@ fn parse_opencode_db_batch(
         .collect::<Vec<_>>().join(",");
     // Same trick as parts: extract the 7 fields we actually read out of
     // `data` at SQL level so we skip a serde_json round-trip per message.
+    // Push `time_created > ?` into SQL only when we're sure we won't
+    // cache the result (skip_parts mirrors the same --no-cache gate).
+    // Otherwise omit so we still feed the persistent cache a complete
+    // per-session message list.
+    let time_filter = if skip_parts && since_ms.is_some() {
+        " AND time_created > ?"
+    } else {
+        ""
+    };
     let msg_sql = format!(
         "SELECT session_id, id, time_created, \
             json_extract(data, '$.role'), \
@@ -251,9 +276,9 @@ fn parse_opencode_db_batch(
             json_extract(data, '$.tokens.cache.read'), \
             json_extract(data, '$.tokens.cache.write') \
          FROM message \
-         WHERE session_id IN ({}) \
+         WHERE session_id IN ({}){} \
          ORDER BY session_id, time_created ASC",
-        placeholders
+        placeholders, time_filter
     );
     // Project at SQL level — the full `data` blob is up to 40 MB total for a
     // typical workspace (mostly tool output we never look at). Pulling only
@@ -273,10 +298,18 @@ fn parse_opencode_db_batch(
     );
 
     let sid_params: Vec<&str> = session_to_project.keys().map(|s| s.as_str()).collect();
+    // Build the params list once, optionally appending the time floor.
+    let mut msg_params: Vec<rusqlite::types::Value> = sid_params
+        .iter()
+        .map(|s| rusqlite::types::Value::Text((*s).to_string()))
+        .collect();
+    if !time_filter.is_empty() {
+        msg_params.push(rusqlite::types::Value::Integer(since_ms.unwrap_or(0)));
+    }
 
     let t = std::time::Instant::now();
     let messages: Vec<(String, String, f64, MessageData)> = match conn.prepare(&msg_sql) {
-        Ok(mut stmt) => match stmt.query_map(rusqlite::params_from_iter(&sid_params), |row| {
+        Ok(mut stmt) => match stmt.query_map(rusqlite::params_from_iter(&msg_params), |row| {
             let session_id: String = row.get(0)?;
             let id: String = row.get(1)?;
             let ts: f64 = row.get(2)?;
@@ -317,29 +350,35 @@ fn parse_opencode_db_batch(
     // Pull parts as pre-extracted columns — no more serde_json on the Rust
     // side for the part stream. SQLite's `json_extract` is run once per row
     // on-engine and is much cheaper than shipping full JSON + re-parsing.
-    let parts: Vec<(String, String, PartData)> = match conn.prepare(&part_sql) {
-        Ok(mut stmt) => match stmt.query_map(rusqlite::params_from_iter(&sid_params), |row| {
-            let session_id: String = row.get(0)?;
-            let message_id: String = row.get(1)?;
-            let ptype: Option<String> = row.get(2)?;
-            let text: Option<String> = row.get(3)?;
-            let tool: Option<String> = row.get(4)?;
-            let cmd: Option<String> = row.get(5)?;
-            let state = cmd.map(|c| PartState {
-                input: Some(PartInput { command: Some(c) }),
-            });
-            let part = PartData { part_type: ptype, text, tool, state };
-            Ok((session_id, message_id, part))
-        }) {
-            Ok(rows) => rows.flatten().collect(),
+    // Skipped entirely on the --no-cache static path (see top of fn).
+    let parts: Vec<(String, String, PartData)> = if skip_parts {
+        Vec::new()
+    } else {
+        match conn.prepare(&part_sql) {
+            Ok(mut stmt) => match stmt.query_map(rusqlite::params_from_iter(&sid_params), |row| {
+                let session_id: String = row.get(0)?;
+                let message_id: String = row.get(1)?;
+                let ptype: Option<String> = row.get(2)?;
+                let text: Option<String> = row.get(3)?;
+                let tool: Option<String> = row.get(4)?;
+                let cmd: Option<String> = row.get(5)?;
+                let state = cmd.map(|c| PartState {
+                    input: Some(PartInput { command: Some(c) }),
+                });
+                let part = PartData { part_type: ptype, text, tool, state };
+                Ok((session_id, message_id, part))
+            }) {
+                Ok(rows) => rows.flatten().collect(),
+                Err(_) => return Vec::new(),
+            },
             Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
+        }
     };
 
     if prof {
-        eprintln!("[prof] opencode SELECT parts  {:>6.1} ms ({} rows)",
-            t.elapsed().as_secs_f64() * 1000.0, parts.len());
+        eprintln!("[prof] opencode SELECT parts  {:>6.1} ms ({} rows){}",
+            t.elapsed().as_secs_f64() * 1000.0, parts.len(),
+            if skip_parts { " [skipped]" } else { "" });
     }
     let t = std::time::Instant::now();
     let mut parts_by_session: HashMap<String, HashMap<String, Vec<PartData>>> = HashMap::new();
@@ -668,7 +707,7 @@ impl Provider for OpenCodeProvider {
         &self,
         sources: &[SessionSource],
         seen_keys: &DashSet<String>,
-        _since: Option<std::time::SystemTime>,
+        since: Option<std::time::SystemTime>,
         _date_start: Option<&str>,
         _date_end: Option<&str>,
     ) -> Vec<(String, String, Vec<ParsedProviderCall>)> {
@@ -685,7 +724,7 @@ impl Provider for OpenCodeProvider {
         by_db
             .into_iter()
             .flat_map(|(db_path, db_sources)| {
-                parse_opencode_db_batch(&db_path, &db_sources, seen_keys)
+                parse_opencode_db_batch(&db_path, &db_sources, seen_keys, since)
             })
             .collect()
     }

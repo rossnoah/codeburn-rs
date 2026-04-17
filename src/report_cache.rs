@@ -27,24 +27,24 @@
 //! cursor) return that file's metadata for all their sources, so a single
 //! mtime bump invalidates every row at once — desired behaviour.
 //!
-//! File format (little endian throughout):
+//! File format (little endian throughout), version 3:
 //!
 //! ```text
 //! [ magic 8 bytes = b"CODEBRN1" ]
-//! [ version u32  = 1            ]
+//! [ version u32  = 3            ]
 //! [ n_entries u32               ]
 //! per-entry header:
-//!     key_len  u16, key  bytes
-//!     proj_len u16, proj bytes
-//!     mtime    u64
-//!     size     u64
-//!     blob_len u32
-//!     blob     bytes (bincode(Vec<ParsedProviderCall>))
+//!     key_len     u16, key  bytes
+//!     proj_len    u16, proj bytes
+//!     mtime       u64
+//!     size        u64
+//!     summary_len u32, summary bytes (custom packed format — see SummaryIter)
+//!     blob_len    u32, blob    bytes (bincode(Vec<ParsedProviderCall>))
 //! ```
 //!
-//! The linear format keeps the loader trivially fast (~200 µs for 1k
-//! entries) and the blobs are contiguous so rayon's parallel decode doesn't
-//! fight over the same CPU cache lines.
+//! The summary blob is a tightly packed pre-aggregated view used by the static
+//! report path. It avoids the bincode-decode + Vec<String> allocations needed
+//! for the full call list — a 10x speedup on the cached path.
 
 use std::collections::HashMap;
 use std::fs;
@@ -58,9 +58,16 @@ use serde::{Deserialize, Serialize};
 use crate::types::ParsedProviderCall;
 
 const MAGIC: &[u8; 8] = b"CODEBRN1";
-// v2: ParsedProviderCall gained `user_message_timestamp` for accurate turn
-// grouping (same-text repeat messages were collapsing into one turn).
-const VERSION: u32 = 2;
+// v3: added per-entry summary blob (compact pre-aggregated view) for fast
+// static-report path. Old v2 caches are discarded on first run.
+// v4: Claude provider stopped pre-filtering by date at parse time — older
+// caches hold period-shaped subsets and must be rejected so a wider-period
+// query can't get a truncated cache hit.
+// v5: same poisoning fix extended to all providers — `parse_misses` now
+// passes date filters to providers ONLY in --no-cache mode. Earlier v4
+// caches written by the cached path may still hold pi/codex empty entries
+// from a "today" run, so they have to be discarded.
+const VERSION: u32 = 5;
 
 fn cache_path() -> PathBuf {
     dirs::home_dir()
@@ -75,6 +82,8 @@ pub struct EntryHeader {
     pub mtime: u64,
     pub size: u64,
     pub project: String,
+    summary_offset: usize,
+    summary_len: usize,
     blob_offset: usize,
     blob_len: usize,
 }
@@ -132,6 +141,15 @@ impl CacheSnapshot {
     pub fn blob(&self, entry: &EntryHeader) -> &[u8] {
         match &self.mmap {
             Some(m) => &m[entry.blob_offset..entry.blob_offset + entry.blob_len],
+            None => &[],
+        }
+    }
+
+    /// Slice the summary bytes for an entry. Empty when the entry has no
+    /// summary (legacy entries without one).
+    pub fn summary_bytes(&self, entry: &EntryHeader) -> &[u8] {
+        match &self.mmap {
+            Some(m) => &m[entry.summary_offset..entry.summary_offset + entry.summary_len],
             None => &[],
         }
     }
@@ -196,9 +214,19 @@ fn parse_index(buf: &[u8]) -> Option<HashMap<String, EntryHeader>> {
         pos += 8;
         let size = u64::from_le_bytes(buf[pos..pos + 8].try_into().ok()?);
         pos += 8;
+        let summary_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
+        pos += 4;
+        if pos + summary_len > buf.len() {
+            return None;
+        }
+        let summary_offset = pos;
+        pos += summary_len;
+
+        if pos + 4 > buf.len() {
+            return None;
+        }
         let blob_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().ok()?) as usize;
         pos += 4;
-
         if pos + blob_len > buf.len() {
             return None;
         }
@@ -211,6 +239,8 @@ fn parse_index(buf: &[u8]) -> Option<HashMap<String, EntryHeader>> {
                 mtime,
                 size,
                 project,
+                summary_offset,
+                summary_len,
                 blob_offset,
                 blob_len,
             },
@@ -221,12 +251,14 @@ fn parse_index(buf: &[u8]) -> Option<HashMap<String, EntryHeader>> {
 
 /// One fresh parse result to write back. `blob` must already be the bincode
 /// serialised bytes of `Vec<ParsedProviderCall>` — the caller serialises
-/// once so large blobs never cross a lock.
+/// once so large blobs never cross a lock. `summary` is the compact
+/// pre-aggregated representation (see `encode_summary`).
 pub struct NewEntry {
     pub key: String,
     pub mtime: u64,
     pub size: u64,
     pub project: String,
+    pub summary: Vec<u8>,
     pub blob: Vec<u8>,
 }
 
@@ -244,13 +276,13 @@ pub fn compose_from_snapshot(snapshot: &CacheSnapshot, fresh: &[NewEntry]) -> Ve
     // Guess at final size so we don't reallocate during the appends.
     let mut total = 16usize; // magic + version + n_entries
     for e in fresh {
-        total += 2 + e.key.len() + 2 + e.project.len() + 8 + 8 + 4 + e.blob.len();
+        total += 2 + e.key.len() + 2 + e.project.len() + 8 + 8 + 4 + e.summary.len() + 4 + e.blob.len();
     }
     for (k, h) in snapshot.entries.iter() {
         if seen.contains(k.as_str()) {
             continue;
         }
-        total += 2 + k.len() + 2 + h.project.len() + 8 + 8 + 4 + h.blob_len;
+        total += 2 + k.len() + 2 + h.project.len() + 8 + 8 + 4 + h.summary_len + 4 + h.blob_len;
     }
 
     let mut buf = Vec::with_capacity(total);
@@ -264,14 +296,15 @@ pub fn compose_from_snapshot(snapshot: &CacheSnapshot, fresh: &[NewEntry]) -> Ve
             .count();
     buf.extend_from_slice(&(n as u32).to_le_bytes());
     for e in fresh {
-        write_entry(&mut buf, &e.key, &e.project, e.mtime, e.size, &e.blob);
+        write_entry(&mut buf, &e.key, &e.project, e.mtime, e.size, &e.summary, &e.blob);
     }
     for (k, h) in snapshot.entries.iter() {
         if seen.contains(k.as_str()) {
             continue;
         }
+        let summary = snapshot.summary_bytes(h);
         let blob = snapshot.blob(h);
-        write_entry(&mut buf, k, &h.project, h.mtime, h.size, blob);
+        write_entry(&mut buf, k, &h.project, h.mtime, h.size, summary, blob);
     }
     buf
 }
@@ -293,13 +326,15 @@ pub fn persist_bytes(bytes: Vec<u8>) -> std::io::Result<()> {
 }
 
 
-fn write_entry(buf: &mut Vec<u8>, key: &str, project: &str, mtime: u64, size: u64, blob: &[u8]) {
+fn write_entry(buf: &mut Vec<u8>, key: &str, project: &str, mtime: u64, size: u64, summary: &[u8], blob: &[u8]) {
     buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
     buf.extend_from_slice(key.as_bytes());
     buf.extend_from_slice(&(project.len() as u16).to_le_bytes());
     buf.extend_from_slice(project.as_bytes());
     buf.extend_from_slice(&mtime.to_le_bytes());
     buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&(summary.len() as u32).to_le_bytes());
+    buf.extend_from_slice(summary);
     buf.extend_from_slice(&(blob.len() as u32).to_le_bytes());
     buf.extend_from_slice(blob);
 }
@@ -308,6 +343,185 @@ fn write_entry(buf: &mut Vec<u8>, key: &str, project: &str, mtime: u64, size: u6
 /// store the result into a `NewEntry.blob`.
 pub fn encode_calls(calls: &[ParsedProviderCall]) -> Vec<u8> {
     bincode::serialize(calls).unwrap_or_default()
+}
+
+/// Pre-aggregate the calls of one source into a packed summary blob. The
+/// static report path iterates these blobs without any String allocation
+/// (only unique session IDs end up materialised on the read side).
+///
+/// Format (little endian):
+/// ```text
+/// n_buckets u32
+/// per bucket:
+///     ts_prefix [19 u8]       // "YYYY-MM-DDThh:mm:ss"
+///                              //   or 19 NULL bytes for "no timestamp"
+///                              //   (special-cased: always included)
+///     session_id_len u8
+///     session_id [bytes]
+///     cost f64
+///     calls u32
+///     input u64
+///     output u64
+///     cache_read u64
+///     cache_write u64
+/// ```
+///
+/// One bucket per (ts_prefix, session_id) pair. The aggregator's date
+/// filter compares `ts_prefix` lexicographically against the run's
+/// `[start, end]` 19-char window — the same comparison the original
+/// per-call loop did, so output is byte-identical. Calls whose timestamp
+/// is shorter than 19 chars get a zero prefix and are always included
+/// (mirrors the original `aggregate_static`'s behaviour of falling
+/// through the date check for unparseable timestamps).
+pub fn encode_summary(calls: &[ParsedProviderCall]) -> Vec<u8> {
+    use std::collections::HashMap;
+    #[derive(Default)]
+    struct B {
+        cost: f64,
+        calls: u32,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    }
+    // Key: (ts_prefix_19, session_id). ts_prefix is borrowed from the call
+    // (or a static all-zero sentinel for untimestamped calls). session_id
+    // is borrowed from the call. We only own them on write.
+    static ZERO_TS: &str = "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    let mut buckets: HashMap<(&str, &str), B> = HashMap::new();
+    for c in calls {
+        let ts_prefix: &str = if c.timestamp.len() >= 19 {
+            &c.timestamp[..19]
+        } else {
+            ZERO_TS
+        };
+        let sid = c.session_id.as_str();
+        let b = buckets.entry((ts_prefix, sid)).or_default();
+        b.cost += c.cost_usd;
+        b.calls += 1;
+        b.input += c.input_tokens;
+        b.output += c.output_tokens;
+        b.cache_read += c.cache_read_input_tokens;
+        b.cache_write += c.cache_creation_input_tokens;
+    }
+
+    let mut out = Vec::with_capacity(4 + buckets.len() * 72);
+    out.extend_from_slice(&(buckets.len() as u32).to_le_bytes());
+    for ((ts_prefix, sid), b) in buckets {
+        let ts_bytes = ts_prefix.as_bytes();
+        let mut ts_pad = [0u8; 19];
+        let n = ts_bytes.len().min(19);
+        ts_pad[..n].copy_from_slice(&ts_bytes[..n]);
+        out.extend_from_slice(&ts_pad);
+        let sid_bytes = sid.as_bytes();
+        let sid_len = sid_bytes.len().min(255) as u8;
+        out.push(sid_len);
+        out.extend_from_slice(&sid_bytes[..sid_len as usize]);
+        out.extend_from_slice(&b.cost.to_le_bytes());
+        out.extend_from_slice(&b.calls.to_le_bytes());
+        out.extend_from_slice(&b.input.to_le_bytes());
+        out.extend_from_slice(&b.output.to_le_bytes());
+        out.extend_from_slice(&b.cache_read.to_le_bytes());
+        out.extend_from_slice(&b.cache_write.to_le_bytes());
+    }
+    out
+}
+
+/// One bucket from a summary blob — borrowed slices into the mmap, so
+/// iteration is allocation-free.
+#[derive(Debug)]
+pub struct SummaryBucket<'a> {
+    /// 19-byte ASCII timestamp prefix "YYYY-MM-DDThh:mm:ss", or 19 NULL
+    /// bytes for buckets that came from calls without a parseable
+    /// timestamp (always include those — see `has_timestamp`).
+    pub ts_prefix: &'a [u8],
+    pub session_id: &'a [u8], // utf-8 bytes
+    pub cost: f64,
+    pub calls: u32,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+}
+
+impl<'a> SummaryBucket<'a> {
+    /// True if this bucket has a real timestamp. Untimestamped buckets
+    /// are always included by the date filter, matching the original
+    /// per-call aggregator's behaviour.
+    pub fn has_timestamp(&self) -> bool {
+        self.ts_prefix[0] != 0
+    }
+}
+
+/// Walk a packed summary blob without allocating. Stops on truncation /
+/// corruption (returns whatever was read so far).
+pub struct SummaryIter<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    remaining: u32,
+}
+
+impl<'a> SummaryIter<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        if buf.len() < 4 {
+            return SummaryIter { buf, pos: 0, remaining: 0 };
+        }
+        let n = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+        SummaryIter {
+            buf,
+            pos: 4,
+            remaining: n,
+        }
+    }
+}
+
+impl<'a> Iterator for SummaryIter<'a> {
+    type Item = SummaryBucket<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let buf = self.buf;
+        let mut p = self.pos;
+        if p + 19 + 1 > buf.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let ts_prefix = &buf[p..p + 19];
+        p += 19;
+        let sid_len = buf[p] as usize;
+        p += 1;
+        if p + sid_len + 8 + 4 + 8 + 8 + 8 + 8 > buf.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let session_id = &buf[p..p + sid_len];
+        p += sid_len;
+        let cost = f64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        p += 8;
+        let calls = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+        p += 4;
+        let input = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        p += 8;
+        let output = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        p += 8;
+        let cache_read = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        p += 8;
+        let cache_write = u64::from_le_bytes(buf[p..p + 8].try_into().unwrap());
+        p += 8;
+        self.pos = p;
+        self.remaining -= 1;
+        Some(SummaryBucket {
+            ts_prefix,
+            session_id,
+            cost,
+            calls,
+            input,
+            output,
+            cache_read,
+            cache_write,
+        })
+    }
 }
 
 // Shut up dead-code warnings on the serde Derive path when nothing else

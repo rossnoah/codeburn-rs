@@ -11,6 +11,7 @@
 #   ./bench.sh                      # all providers
 #   ./bench.sh --provider cursor    # single provider
 #   ./bench.sh --runs 10 --warmup 3
+#   ./bench.sh --no-js              # skip JS benchmark for fast iteration
 
 set -euo pipefail
 
@@ -26,17 +27,13 @@ if ! command -v hyperfine >/dev/null; then
   exit 1
 fi
 
-if ! command -v npx >/dev/null; then
-  echo "npx is required" >&2
-  exit 1
-fi
-
 PROVIDER="all"
 PERIOD="week"
 RUNS=5
 WARMUP=2
 MODE="cache"   # "nocache" = wipe cursor disk cache + pass --no-cache
                  # "cache"   = let both sides use their on-disk caches
+NO_JS=0
 EXTRA=()
 
 while [ $# -gt 0 ]; do
@@ -46,9 +43,15 @@ while [ $# -gt 0 ]; do
     --runs)     RUNS="$2";     shift 2 ;;
     --warmup)   WARMUP="$2";   shift 2 ;;
     --mode)     MODE="$2";     shift 2 ;;
+    --no-js)    NO_JS=1;       shift   ;;
     *)          EXTRA+=("$1"); shift   ;;
   esac
 done
+
+if [ "$NO_JS" -eq 0 ] && ! command -v npx >/dev/null; then
+  echo "npx is required (or pass --no-js to skip the JS benchmark)" >&2
+  exit 1
+fi
 
 case "$MODE" in
   nocache)
@@ -79,7 +82,9 @@ esac
 
 echo "mode: $MODE"
 echo "rust: $RUST_CMD"
-echo "js:   $JS_CMD"
+if [ "$NO_JS" -eq 0 ]; then
+  echo "js:   $JS_CMD"
+fi
 echo
 
 HF_ARGS=(--warmup "$WARMUP" --runs "$RUNS")
@@ -87,8 +92,15 @@ if [ -n "$PREPARE" ]; then
   HF_ARGS+=(--prepare "$PREPARE")
 fi
 
-exec hyperfine \
-  "${HF_ARGS[@]}" \
-  -n "$RUST_LABEL" "$RUST_CMD" \
-  -n "$JS_LABEL"   "$JS_CMD" \
-  "${EXTRA[@]}"
+if [ "$NO_JS" -eq 1 ]; then
+  exec hyperfine \
+    "${HF_ARGS[@]}" \
+    -n "$RUST_LABEL" "$RUST_CMD" \
+    "${EXTRA[@]}"
+else
+  exec hyperfine \
+    "${HF_ARGS[@]}" \
+    -n "$RUST_LABEL" "$RUST_CMD" \
+    -n "$JS_LABEL"   "$JS_CMD" \
+    "${EXTRA[@]}"
+fi

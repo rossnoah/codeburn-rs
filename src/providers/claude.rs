@@ -183,30 +183,20 @@ struct TuiToolInput {
     command: Option<String>,
 }
 
-static TIMESTAMP_NEEDLE: std::sync::LazyLock<memmem::Finder<'static>> =
-    std::sync::LazyLock::new(|| memmem::Finder::new(b"\"timestamp\":\""));
-
-/// Extract timestamp from raw bytes without JSON parsing.
-/// Looks for "timestamp":"YYYY-MM-DDThh:mm:ss" and returns the 19-char prefix.
-fn extract_timestamp_fast(line: &[u8]) -> Option<&[u8]> {
-    let pos = TIMESTAMP_NEEDLE.find(line)?;
-    let ts_start = pos + 13; // length of "timestamp":"
-    if ts_start + 19 <= line.len() {
-        Some(&line[ts_start..ts_start + 19])
-    } else {
-        None
-    }
-}
-
 /// 1BRC-style single-pass JSONL parser for the full TUI path.
 /// Uses mmap + memchr line scanning + SIMD pre-filter + simd-json.
 /// Directly produces ParsedProviderCall objects without intermediate structs.
-/// Optional date_start/date_end for pre-filtering lines by timestamp BEFORE JSON parse.
+///
+/// Returns *all* calls from the file regardless of the caller's requested date
+/// range. Date filtering must happen downstream (in `aggregate_static` and
+/// equivalents), because the results of this function are stored verbatim in
+/// `report-cache.bin` keyed only on `(path, mtime, size)`. Pre-filtering here
+/// would cache a subset shaped by whichever period was active on the writing
+/// run, and a later run with a wider period would get a cache hit and see
+/// truncated data.
 fn parse_jsonl_mmap_full(
     file_bytes: &[u8],
     seen_ids: &DashSet<String>,
-    date_start: Option<&[u8]>,
-    date_end: Option<&[u8]>,
 ) -> Vec<ParsedProviderCall> {
     let mut results: Vec<ParsedProviderCall> = Vec::new();
     let mut current_user_message = String::new();
@@ -233,24 +223,6 @@ fn parse_jsonl_mmap_full(
 
         if !is_assistant && !is_user {
             continue;
-        }
-
-        // Date-range pre-filter: extract timestamp from raw bytes BEFORE JSON parse.
-        // For assistant lines, skip entries clearly outside the date range.
-        // Only check the DATE portion (first 10 bytes: YYYY-MM-DD) to avoid timezone issues.
-        if is_assistant {
-            if let Some(ts_bytes) = extract_timestamp_fast(line) {
-                if let Some(ds) = date_start {
-                    if ts_bytes.len() >= 10 && ds.len() >= 10 && &ts_bytes[..10] < &ds[..10] {
-                        continue; // Definitely before date range start day
-                    }
-                }
-                if let Some(de) = date_end {
-                    if ts_bytes.len() >= 10 && de.len() >= 10 && &ts_bytes[..10] > &de[..10] {
-                        continue; // Definitely after date range end day
-                    }
-                }
-            }
         }
 
         let mut line_buf = line.to_vec();
@@ -650,15 +622,51 @@ impl Provider for ClaudeProvider {
         self.parse_session_filtered(source, seen_keys, None, None, None)
     }
 
+    fn parse_sources(
+        &self,
+        sources: &[SessionSource],
+        seen_keys: &DashSet<String>,
+        since: Option<SystemTime>,
+        date_start: Option<&str>,
+        date_end: Option<&str>,
+    ) -> Vec<(String, String, Vec<ParsedProviderCall>)> {
+        // Chunked rayon iteration: 1100 individual `par_iter` tasks
+        // generates a lot of work-steal overhead — each per-file unit
+        // is just a stat + maybe a parse, and queueing those tasks fights
+        // with cursor's chunks for the same workers. Splitting into ~64
+        // chunks of ~17 sources each keeps the per-task work meaningful
+        // and lets the rayon work-stealing queue stay short.
+        use rayon::prelude::*;
+        let chunk_size = sources.len().div_ceil(64).max(1);
+        sources
+            .par_chunks(chunk_size)
+            .flat_map_iter(|chunk| {
+                let mut out: Vec<(String, String, Vec<ParsedProviderCall>)> =
+                    Vec::with_capacity(chunk.len());
+                for source in chunk {
+                    let calls = self
+                        .parse_session_filtered(source, seen_keys, since, date_start, date_end)
+                        .unwrap_or_default();
+                    if !calls.is_empty() {
+                        out.push((source.path.clone(), source.project.clone(), calls));
+                    }
+                }
+                out
+            })
+            .collect()
+    }
+
     fn parse_session_filtered(
         &self,
         source: &SessionSource,
         seen_keys: &DashSet<String>,
         since: Option<SystemTime>,
-        date_start: Option<&str>,
-        date_end: Option<&str>,
+        _date_start: Option<&str>,
+        _date_end: Option<&str>,
     ) -> Result<Vec<ParsedProviderCall>> {
-        // Post-refactor: `source.path` is a single jsonl file.
+        // `date_start`/`date_end` are intentionally ignored here. See
+        // `parse_jsonl_mmap_full` for why filtering must happen downstream
+        // rather than at parse time.
         let path = Path::new(&source.path);
 
         if let Some(since_t) = since {
@@ -683,19 +691,12 @@ impl Provider for ClaudeProvider {
             return Ok(Vec::new());
         }
 
-        let ds_bytes: Option<Vec<u8>> = date_start.map(|s| s.as_bytes().to_vec());
-        let de_bytes: Option<Vec<u8>> = date_end.map(|s| s.as_bytes().to_vec());
         let file_session_id = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let mut calls = parse_jsonl_mmap_full(
-            &mmap,
-            seen_keys,
-            ds_bytes.as_deref(),
-            de_bytes.as_deref(),
-        );
+        let mut calls = parse_jsonl_mmap_full(&mmap, seen_keys);
         for call in &mut calls {
             call.session_id = file_session_id.clone();
         }

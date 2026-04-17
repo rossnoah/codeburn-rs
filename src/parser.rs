@@ -491,6 +491,7 @@ fn spawn_persist(
                 mtime: *mtime,
                 size: *size,
                 project: project.clone(),
+                summary: crate::report_cache::encode_summary(calls),
                 blob: crate::report_cache::encode_calls(calls),
             }
         })
@@ -624,6 +625,12 @@ pub struct StaticAggregate {
 /// `parse_all_sessions` does up through cache decode + miss parse, but
 /// skips classification + the per-session HashMap build. Returns only the
 /// numbers `render_static` actually reads.
+///
+/// For cache hits this skips bincode decoding entirely — it iterates the
+/// per-entry compact summary blob (added in cache v3) instead. The summary
+/// is an order of magnitude smaller than the full call list and contains
+/// exactly the fields `aggregate_static` needs (cost, call count, the four
+/// token totals, and session ID for global de-dup).
 pub fn parse_all_sessions_static(
     date_range: Option<&DateRange>,
     provider_filter: Option<&str>,
@@ -667,34 +674,30 @@ pub fn parse_all_sessions_static(
         );
     }
 
-    let t_decode = Instant::now();
-    let hit_calls = decode_cache_hits(&snapshot, &hits);
-    prof_log("cache decode hits", t_decode);
-
     let seen_keys: DashSet<String> = DashSet::new();
     let t_parse = Instant::now();
+    // Pass date filters to providers ONLY when --no-cache is set. In
+    // cached mode the parse result feeds `spawn_persist`, and storing a
+    // date-shaped subset would poison the cache: a later run with a
+    // wider period would get a hit and see truncated data.
+    //
+    // The poisoning was visible in pi/codex/claude when populating the
+    // cache via a "today" run and then querying "30days" — those
+    // providers all use `since` to bail out early on stale files.
+    let (parse_since, parse_ds, parse_de) = if bypass {
+        (since, date_start_str.as_deref(), date_end_str.as_deref())
+    } else {
+        (None, None, None)
+    };
     let miss_results = parse_misses(
         &providers,
         &misses_by_provider,
         &seen_keys,
-        since,
-        date_start_str.as_deref(),
-        date_end_str.as_deref(),
+        parse_since,
+        parse_ds,
+        parse_de,
     );
     prof_log("parallel provider parse", t_parse);
-
-    // Build the (project, &[calls]) view: hits own their Vecs; misses borrow
-    // directly from the `miss_results` returned above so we skip one Vec
-    // clone per hit vs the full `parse_all_sessions` path.
-    let source_views: Vec<(&str, &[ParsedProviderCall])> = hit_calls
-        .iter()
-        .map(|(p, c)| (p.as_str(), c.as_slice()))
-        .chain(
-            miss_results
-                .iter()
-                .map(|(_, project, calls)| (project.as_str(), calls.as_slice())),
-        )
-        .collect();
 
     let t_persist = Instant::now();
     if !bypass {
@@ -703,16 +706,14 @@ pub fn parse_all_sessions_static(
     prof_log("cache persist compose", t_persist);
 
     let t_agg = Instant::now();
-    let agg = aggregate_static(&source_views, date_range);
+    let agg = aggregate_static_from_summary(&snapshot, &hits, &miss_results, date_range);
     prof_log("static aggregate", t_agg);
 
     // Drop the ~30 k ParsedProviderCall vectors off the hot path — their
     // combined String fields take ~4 ms to deallocate, which we don't want
     // the user's `codeburn report` to wait on. We've already extracted every
     // number we need into `agg`.
-    drop(source_views);
     std::thread::spawn(move || {
-        drop(hit_calls);
         drop(miss_results);
     });
 
@@ -720,6 +721,158 @@ pub fn parse_all_sessions_static(
     Ok(agg)
 }
 
+/// Aggregate cache hits straight from their packed summary blobs (no
+/// bincode decode), plus parse-miss results (still per-call). For the warm
+/// cached path this skips the ~10 ms `cache decode hits` step entirely.
+fn aggregate_static_from_summary(
+    snapshot: &CacheSnapshot,
+    hits: &[(&EntryHeader, String)],
+    miss_results: &[(String, String, Vec<ParsedProviderCall>)],
+    date_range: Option<&DateRange>,
+) -> StaticAggregate {
+    let (start_str, end_str) = match date_range {
+        Some(dr) => (
+            dr.start
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+            dr.end
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S")
+                .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let start_bytes = start_str.as_bytes();
+    let end_bytes = end_str.as_bytes();
+    let date_filter_active = !start_str.is_empty();
+
+    #[derive(Default)]
+    struct ProjectAcc {
+        cost: f64,
+        calls: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        sessions: rustc_hash::FxHashSet<String>,
+    }
+
+    // Hit aggregation: parallel over sources, iterate the packed summary
+    // blob inline. No String allocations beyond the unique session-id ones
+    // that survive the HashSet check.
+    let hit_acc: Vec<(&str, ProjectAcc)> = hits
+        .par_iter()
+        .map(|(entry, project)| {
+            let mut acc = ProjectAcc::default();
+            for b in crate::report_cache::SummaryIter::new(snapshot.summary_bytes(entry)) {
+                // 19-byte ASCII prefix compare, matching the original
+                // per-call `aggregate_static`. Buckets without a real
+                // timestamp (zero prefix) are always included — same
+                // fall-through behaviour the original loop had.
+                if date_filter_active && b.has_timestamp() {
+                    if b.ts_prefix < start_bytes || b.ts_prefix > end_bytes {
+                        continue;
+                    }
+                }
+                acc.cost += b.cost;
+                acc.calls += b.calls as u64;
+                acc.input += b.input;
+                acc.output += b.output;
+                acc.cache_read += b.cache_read;
+                acc.cache_write += b.cache_write;
+                if !b.session_id.is_empty() {
+                    if let Ok(s) = std::str::from_utf8(b.session_id) {
+                        acc.sessions.insert(s.to_string());
+                    }
+                }
+            }
+            (project.as_str(), acc)
+        })
+        .collect();
+
+    // Miss aggregation: still iterate the per-call list since we don't have
+    // a summary in memory yet — it's being composed for persist on a side
+    // thread. Same shape as the hit loop.
+    let miss_acc: Vec<(&str, ProjectAcc)> = miss_results
+        .par_iter()
+        .map(|(_, project, calls)| {
+            let mut acc = ProjectAcc::default();
+            for call in calls {
+                // Match original `aggregate_static`: only filter when both
+                // the date range is set AND the timestamp is parseable.
+                // Calls without a 19-char timestamp prefix fall through
+                // and get aggregated unconditionally.
+                if date_filter_active && call.timestamp.len() >= 19 {
+                    let prefix = &call.timestamp.as_bytes()[..19];
+                    if prefix < start_bytes || prefix > end_bytes {
+                        continue;
+                    }
+                }
+                acc.cost += call.cost_usd;
+                acc.calls += 1;
+                acc.input += call.input_tokens;
+                acc.output += call.output_tokens;
+                acc.cache_read += call.cache_read_input_tokens;
+                acc.cache_write += call.cache_creation_input_tokens;
+                if !call.session_id.is_empty() {
+                    acc.sessions.insert(call.session_id.clone());
+                }
+            }
+            (project.as_str(), acc)
+        })
+        .collect();
+
+    let mut by_project: HashMap<String, ProjectAcc> = HashMap::new();
+    let mut global_sessions: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_cache_write = 0u64;
+
+    for (project, acc) in hit_acc.into_iter().chain(miss_acc.into_iter()) {
+        total_input += acc.input;
+        total_output += acc.output;
+        total_cache_read += acc.cache_read;
+        total_cache_write += acc.cache_write;
+        for s in &acc.sessions {
+            global_sessions.insert(s.clone());
+        }
+        let entry = by_project.entry(project.to_string()).or_default();
+        entry.cost += acc.cost;
+        entry.calls += acc.calls;
+        for s in acc.sessions {
+            entry.sessions.insert(s);
+        }
+    }
+
+    let mut projects: Vec<StaticProjectAggregate> = by_project
+        .into_iter()
+        .filter(|(_, a)| a.calls > 0)
+        .map(|(p, a)| StaticProjectAggregate {
+            project_path: unsanitize_path(&p),
+            total_cost_usd: a.cost,
+            total_api_calls: a.calls,
+        })
+        .collect();
+    projects.sort_by(|a, b| {
+        b.total_cost_usd
+            .partial_cmp(&a.total_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.project_path.cmp(&b.project_path))
+    });
+
+    StaticAggregate {
+        projects,
+        total_sessions: global_sessions.len(),
+        total_input,
+        total_output,
+        total_cache_read,
+        total_cache_write,
+    }
+}
+
+#[allow(dead_code)]
 fn aggregate_static(
     source_views: &[(&str, &[ParsedProviderCall])],
     date_range: Option<&DateRange>,
@@ -886,15 +1039,23 @@ pub fn parse_all_sessions(
     prof_log("cache decode hits", t_decode);
 
     // Providers return `(source_path, project, calls)` so each miss maps
-    // cleanly to a cache entry.
+    // cleanly to a cache entry. Same caveat as `parse_all_sessions_static`:
+    // we only push date filters into the providers when --no-cache is set.
+    // In cached mode the result feeds `spawn_persist`, and a date-shaped
+    // subset would poison the cache for any subsequent wider-period query.
     let t_parse = Instant::now();
+    let (parse_since, parse_ds, parse_de) = if bypass {
+        (since, date_start_str.as_deref(), date_end_str.as_deref())
+    } else {
+        (None, None, None)
+    };
     let miss_results = parse_misses(
         &providers,
         &misses_by_provider,
         &seen_keys,
-        since,
-        date_start_str.as_deref(),
-        date_end_str.as_deref(),
+        parse_since,
+        parse_ds,
+        parse_de,
     );
     prof_log("parallel provider parse", t_parse);
 

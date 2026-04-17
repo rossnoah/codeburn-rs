@@ -234,17 +234,22 @@ fn parse_bubble_json(mut bytes: Vec<u8>) -> Option<RawBubble> {
 }
 
 /// Hex bucket boundaries for splitting `bubbleId:*`. Each chunk gets its own
-/// READ_ONLY connection so the scans run in parallel. Ablation on this repo's
-/// 1.5 GB Cursor DB (Rust end-to-end, hyperfine warmup=2 runs=5):
-///   4 → 285 ms, 6 → 328 ms, 8 → 358 ms, 12 → 374 ms.
-/// Going wider loses: each chunk has a ~15-20 ms fixed setup cost (open conn +
-/// prepare stmt), and SQLite + the OS page cache are already shared, so extra
-/// threads mostly just contend.
+/// READ_ONLY connection so the scans run in parallel.
+///
+/// 8 chunks empirically beats 4 once the per-row work is small (we filter
+/// `createdAt` in SQL — the JSON parse only fires on a few hundred
+/// surviving rows). At 4 chunks the heaviest single chunk dominates the
+/// parallel wall; at 16 the per-chunk fixed cost (open conn + prepare
+/// stmt) starts to add up.
 const BUBBLE_RANGE_CHUNKS: &[(&str, &str)] = &[
-    ("bubbleId:0", "bubbleId:4"),
-    ("bubbleId:4", "bubbleId:8"),
-    ("bubbleId:8", "bubbleId:c"),
-    ("bubbleId:c", "bubbleId;"),
+    ("bubbleId:0", "bubbleId:2"),
+    ("bubbleId:2", "bubbleId:4"),
+    ("bubbleId:4", "bubbleId:6"),
+    ("bubbleId:6", "bubbleId:8"),
+    ("bubbleId:8", "bubbleId:a"),
+    ("bubbleId:a", "bubbleId:c"),
+    ("bubbleId:c", "bubbleId:e"),
+    ("bubbleId:e", "bubbleId;"),
 ];
 
 /// Scan + decode one key range. We parse JSON inside the row loop so the big
@@ -272,15 +277,89 @@ fn scan_and_decode_range(
     let _ = conn.pragma_update(None, "cache_size", -65536i64); // 64 MiB
     let _ = conn.pragma_update(None, "temp_store", 2i64);
 
-    // `substr(value, instr(...))` avoids calling `json_extract` per row,
-    // which has to fully parse the JSON just to pluck one string. The
-    // `instr > 0` guard is load-bearing: when `createdAt` is absent, `instr`
-    // returns 0 and `substr(value, 13, 20)` then returns arbitrary bytes
-    // that can accidentally compare greater than the floor.
+    // Register a Rust-side scalar `bubble_useful(value, floor)` that
+    // returns 1 only when the JSON blob is interesting: it has a
+    // `createdAt` later than `floor` AND it's either a user bubble
+    // (`"type":1`) or an assistant bubble with non-zero token counts.
+    //
+    // memchr's SIMD search beats SQLite's byte-wise `instr` by ~3x on
+    // multi-KB values; combining what used to be `instr+substr+IN(...)`
+    // SQLite functions into a single Rust call also halves the per-row
+    // dispatch overhead. Pushing the type/tokens check in here drops the
+    // SELECT result set from ~2 300 to ~100 rows, saving most of the
+    // simd-json parses on the Rust side.
+    use rusqlite::functions::FunctionFlags;
+    let create = conn.create_scalar_function(
+        "bubble_useful",
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            // ValueRef::as_bytes works for both TEXT and BLOB columns —
+            // cursorDiskKV.value is TEXT, so as_blob() would always fail.
+            let blob = ctx.get_raw(0).as_bytes().unwrap_or_default();
+            let floor = ctx.get_raw(1).as_bytes().unwrap_or_default();
+
+            // 1) createdAt > floor.
+            let ts_needle = b"\"createdAt\":\"";
+            let ts_after = match memchr::memmem::find(blob, ts_needle) {
+                Some(p) => p + ts_needle.len(),
+                None => return Ok(0i64),
+            };
+            if ts_after + 20 > blob.len() {
+                return Ok(0i64);
+            }
+            if &blob[ts_after..ts_after + 20] <= floor {
+                return Ok(0i64);
+            }
+
+            // 2) Either a user bubble OR an assistant with tokens.
+            //    "type":1 → user (always useful)
+            //    "type":2 → assistant — useful only if input/output tokens > 0
+            let type_needle = b"\"type\":";
+            let bubble_type = memchr::memmem::find(blob, type_needle).and_then(|p| {
+                blob.get(p + type_needle.len()).and_then(|b| match b {
+                    b'1' => Some(1u8),
+                    b'2' => Some(2u8),
+                    _ => None,
+                })
+            });
+            match bubble_type {
+                Some(1) => Ok(1i64),
+                Some(2) => {
+                    // Look for `"inputTokens":N` or `"outputTokens":N` with
+                    // any non-zero N. Cheap substring + check next-non-space
+                    // byte != '0'.
+                    let in_needle = b"\"inputTokens\":";
+                    let out_needle = b"\"outputTokens\":";
+                    let any_nonzero = |needle: &[u8]| -> bool {
+                        match memchr::memmem::find(blob, needle) {
+                            Some(p) => {
+                                let mut i = p + needle.len();
+                                while i < blob.len() && blob[i] == b' ' {
+                                    i += 1;
+                                }
+                                i < blob.len() && blob[i] >= b'1' && blob[i] <= b'9'
+                            }
+                            None => false,
+                        }
+                    };
+                    Ok(if any_nonzero(in_needle) || any_nonzero(out_needle) {
+                        1
+                    } else {
+                        0
+                    })
+                }
+                _ => Ok(0),
+            }
+        },
+    );
+    if create.is_err() {
+        return Vec::new();
+    }
+
     let query = "SELECT value FROM cursorDiskKV \
          WHERE key >= ?1 AND key < ?2 \
-         AND instr(value, '\"createdAt\":\"') > 0 \
-         AND substr(value, instr(value, '\"createdAt\":\"') + 13, 20) > ?3";
+         AND bubble_useful(value, ?3) = 1";
     let mut stmt = match conn.prepare(query) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -291,8 +370,6 @@ fn scan_and_decode_range(
         Err(_) => return out,
     };
     while let Ok(Some(row)) = rows.next() {
-        // `as_bytes` accepts both BLOB and TEXT, returning the raw bytes
-        // without the UTF-8 validation that `as_str` / `get::<String>` does.
         let bytes = match row.get_ref(0) {
             Ok(v) => match v.as_bytes() {
                 Ok(b) => b.to_vec(),

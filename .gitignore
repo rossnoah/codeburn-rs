@@ -1,6 +1,8 @@
 /target
 
 /notes
+/.notes
 /codeburn
 .DS_Store
 *.swp
+

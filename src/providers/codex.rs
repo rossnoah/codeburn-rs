@@ -251,10 +251,17 @@ fn parse_codex_file(
     source: &SessionSource,
     seen_keys: &DashSet<String>,
 ) -> Vec<ParsedProviderCall> {
-    let content = match fs::read_to_string(&source.path) {
-        Ok(c) => c,
+    let file = match fs::File::open(&source.path) {
+        Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    let mmap = match unsafe { memmap2::Mmap::map(&file) } {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    if mmap.is_empty() {
+        return Vec::new();
+    }
 
     let map = crate::providers::common::build_tool_map(TOOL_NAME_MAP);
     let mut results = Vec::new();
@@ -268,11 +275,20 @@ fn parse_codex_file(
     let mut pending_tools: Vec<String> = Vec::new();
     let mut pending_user_message = String::new();
 
-    for line in content.lines() {
-        if line.trim().is_empty() {
+    let mut start = 0;
+    let len = mmap.len();
+    while start < len {
+        let end = memchr::memchr(b'\n', &mmap[start..])
+            .map(|i| start + i)
+            .unwrap_or(len);
+        let line_bytes = &mmap[start..end];
+        start = end + 1;
+
+        if line_bytes.iter().all(|b| b.is_ascii_whitespace()) {
             continue;
         }
-        let entry: CodexEntry = match serde_json::from_str(line) {
+        let mut line_buf = line_bytes.to_vec();
+        let entry: CodexEntry = match simd_json::serde::from_slice(&mut line_buf) {
             Ok(e) => e,
             Err(_) => continue,
         };
@@ -499,6 +515,31 @@ impl Provider for CodexProvider {
         source: &SessionSource,
         seen_keys: &DashSet<String>,
     ) -> Result<Vec<ParsedProviderCall>> {
+        Ok(parse_codex_file(source, seen_keys))
+    }
+
+    fn parse_session_filtered(
+        &self,
+        source: &SessionSource,
+        seen_keys: &DashSet<String>,
+        since: Option<std::time::SystemTime>,
+        _date_start: Option<&str>,
+        _date_end: Option<&str>,
+    ) -> Result<Vec<ParsedProviderCall>> {
+        // Cheap mtime gate: rollouts are append-only files. If the whole
+        // file is older than the requested date range start, no row inside
+        // can be in range. Skip without opening — saves the mmap + line
+        // scan for the bulk of historical rollouts on a "today" or "week"
+        // query.
+        if let Some(since_t) = since {
+            if let Ok(meta) = fs::metadata(&source.path) {
+                if let Ok(mtime) = meta.modified() {
+                    if mtime < since_t {
+                        return Ok(Vec::new());
+                    }
+                }
+            }
+        }
         Ok(parse_codex_file(source, seen_keys))
     }
 
