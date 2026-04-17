@@ -72,15 +72,6 @@ pub fn run_status_sync(fmt: StatusFormat, provider: &str) -> Result<()> {
             });
             println!("{}", serde_json::to_string(&json)?);
         }
-        StatusFormat::Menubar => {
-            println!(
-                "\u{1F525} {}\n---\nCodeBurn | size=14\n---\nToday: {}\n7 Days: {}\nMonth: {}",
-                format_cost(agg.today_cost),
-                format_cost(agg.today_cost),
-                format_cost(agg.week_cost),
-                format_cost(agg.month_cost),
-            );
-        }
     }
 
     Ok(())

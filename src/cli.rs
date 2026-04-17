@@ -79,7 +79,7 @@ pub enum Commands {
 
     /// Compact status output (today + week + month)
     Status {
-        /// Output format: terminal, menubar, json
+        /// Output format: terminal, json
         #[arg(long, default_value = "terminal")]
         format: StatusFormat,
 
@@ -117,12 +117,6 @@ pub enum Commands {
         reset: bool,
     },
 
-    /// Install macOS menu bar plugin (SwiftBar/xbar)
-    InstallMenubar,
-
-    /// Remove macOS menu bar plugin
-    UninstallMenubar,
-
     /// Internal: build the cursor cache in the background. Invoked by a
     /// detached child process so the main report command can return
     /// immediately on cold starts.
@@ -143,7 +137,6 @@ pub enum Period {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum StatusFormat {
     Terminal,
-    Menubar,
     Json,
 }
 

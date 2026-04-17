@@ -21,7 +21,6 @@ mod currency;
 mod discovery_cache;
 mod export;
 mod format;
-mod menubar;
 mod models;
 mod output_cache;
 mod parser;
@@ -86,7 +85,7 @@ fn main() -> Result<()> {
     // The interactive TUI is now fully sync — no tokio runtime startup
     // (~25 ms) and no spawn_blocking overhead per parse. Skip the
     // tokio::runtime::Builder cost for this hot path; the async branches
-    // below (export/currency/menubar) still pay it for network I/O.
+    // below (export/currency) still pay it for network I/O.
     match command {
         Commands::Report { period, provider, refresh } => {
             return tui::run(period, &provider, refresh);
@@ -100,10 +99,7 @@ fn main() -> Result<()> {
         Commands::Status { .. } => unreachable!(),
         Commands::RefreshCursorCache => unreachable!(),
         // The remaining variants drop into the tokio runtime below.
-        Commands::Export { .. }
-        | Commands::Currency { .. }
-        | Commands::InstallMenubar
-        | Commands::UninstallMenubar => {}
+        Commands::Export { .. } | Commands::Currency { .. } => {}
     }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -130,12 +126,6 @@ fn main() -> Result<()> {
                 reset,
             } => {
                 currency::run_currency(code, symbol, reset).await?;
-            }
-            Commands::InstallMenubar => {
-                menubar::install()?;
-            }
-            Commands::UninstallMenubar => {
-                menubar::uninstall()?;
             }
         }
         Ok(())
