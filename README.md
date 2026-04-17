@@ -26,14 +26,6 @@ Measured with hyperfine on a MacBook Pro (M1 Pro, 16GB, 1TB) against `npx codebu
 brew install rossnoah/tap/cburn
 ```
 
-## Usage
-
-Launch the interactive dashboard:
-
-```sh
-cburn
-```
-
 **Shell installer**
 
 ```sh
@@ -44,6 +36,14 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rossnoah/codeburn-rs/re
 
 ```sh
 cargo install --git https://github.com/rossnoah/codeburn-rs
+```
+
+## Usage
+
+Launch the interactive dashboard:
+
+```sh
+cburn
 ```
 
 Other commands:
