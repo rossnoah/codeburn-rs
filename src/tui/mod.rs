@@ -72,6 +72,87 @@ fn period_str(p: Period) -> &'static str {
     }
 }
 
+/// Detect the terminal size for the non-interactive render path, clamped to
+/// sane minimums (60×20) so the dashboard layout always fits.
+///
+/// Prefer `$COLUMNS` / `$LINES` — most shells set these — because
+/// `crossterm::terminal::size()` opens `/dev/tty` under the hood, and even
+/// its failure path costs ~4 ms on macOS when stdin is non-TTY. Only fall
+/// back to crossterm when stdout is a TTY AND the env vars aren't set.
+fn detect_terminal_size() -> (u16, u16) {
+    let env_cols: Option<u16> = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok());
+    let env_rows: Option<u16> = std::env::var("LINES").ok().and_then(|s| s.parse().ok());
+    let (cols, rows) = match (env_cols, env_rows) {
+        (Some(c), Some(r)) => (c, r),
+        _ => {
+            if io::stdout().is_terminal() {
+                crossterm::terminal::size().unwrap_or((100, 40))
+            } else {
+                (env_cols.unwrap_or(100), env_rows.unwrap_or(40))
+            }
+        }
+    };
+    (cols.max(60), rows.max(20))
+}
+
+/// Memoized "parse → render → write to stdout" flow shared by the rich
+/// (`run_render_once`) and static (`run_static_sync`) non-TTY paths.
+///
+/// 1. Compute a session-files signature so an append to any jsonl / DB
+///    flips the output-cache fingerprint. Skipped under `--no-cache` or
+///    `--no-output-cache`.
+/// 2. `try_serve` — if the fingerprint matches, the previous run's bytes
+///    are already on stdout and we return.
+/// 3. Call the caller-supplied `compute` closure with the pre-stats map,
+///    which does the actual parse + render and returns the rendered
+///    bytes. Threading `pre_stats` through means `partition_cache` inside
+///    `parse_all_sessions` reuses the stats we just did for the
+///    fingerprint instead of re-stat'ing every source.
+/// 4. Print the bytes, join persist threads, then `store` the output
+///    cache with a *fresh* session signature. The persist thread may
+///    have just rewritten `report-cache.bin`, so we re-stat after the
+///    join to capture its new mtime.
+fn render_with_output_cache<F>(
+    period: Period,
+    provider: &str,
+    format: &str,
+    extra: u64,
+    compute: F,
+) -> Result<()>
+where
+    F: FnOnce(&HashMap<String, (u64, u64)>) -> Vec<u8>,
+{
+    use std::io::Write;
+    let bypass = crate::parser::is_cache_bypassed();
+    let output_cache_bypass = crate::parser::is_output_cache_bypassed();
+
+    let (pre_stats, session_sig) = if !bypass && !output_cache_bypass {
+        crate::parser::stat_all_sources()
+    } else {
+        (HashMap::new(), 0)
+    };
+
+    if !bypass && !output_cache_bypass
+        && crate::output_cache::try_serve(period_str(period), provider, format, extra, session_sig)
+    {
+        return Ok(());
+    }
+
+    let bytes = compute(&pre_stats);
+
+    {
+        let mut stdout = io::stdout().lock();
+        let _ = stdout.write_all(&bytes);
+    }
+
+    crate::parser::join_pending_persists();
+    if !bypass && !output_cache_bypass {
+        let (_, fresh_sig) = crate::parser::stat_all_sources();
+        crate::output_cache::store(period_str(period), provider, format, extra, fresh_sig, &bytes);
+    }
+    Ok(())
+}
+
 pub fn get_date_range(period: &str) -> DateRange {
     let now = Local::now();
     let today_start = now
@@ -241,8 +322,12 @@ impl App {
         let generation = self.generation;
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let projects = parse_all_sessions(Some(&date_range), filter.as_deref())
-                .unwrap_or_default();
+            let projects = parse_all_sessions(
+                Some(&date_range),
+                filter.as_deref(),
+                &HashMap::new(),
+            )
+            .unwrap_or_default();
             let _ = tx.send(LoadResult {
                 cache_key: key,
                 generation,
@@ -395,8 +480,12 @@ pub fn run(period: Period, provider: &str, refresh: Option<u64>) -> Result<()> {
         let generation = app.generation;
         let tx2 = tx.clone();
         std::thread::spawn(move || {
-            let projects =
-                parse_all_sessions(Some(&date_range), filter.as_deref()).unwrap_or_default();
+            let projects = parse_all_sessions(
+                Some(&date_range),
+                filter.as_deref(),
+                &HashMap::new(),
+            )
+            .unwrap_or_default();
             let _ = tx2.send(LoadResult { cache_key: key, generation, projects });
         });
     }
@@ -685,70 +774,46 @@ pub fn run(period: Period, provider: &str, refresh: Option<u64>) -> Result<()> {
 /// `output_cache` keyed on terminal width so repeat invocations at the
 /// same size short-circuit the parse + render pipeline.
 fn run_render_once(period: Period, provider: &str) -> Result<()> {
-    use std::io::Write;
-
-    let bypass = crate::parser::is_cache_bypassed();
-    let output_cache_bypass = crate::parser::is_output_cache_bypassed();
-
-    // Pick a terminal size. Crossterm's `terminal::size` opens /dev/tty
-    // under the hood — when both stdin and stdout are non-TTY (e.g.
-    // `< /dev/null | head`) it errors out. Fall back to $COLUMNS / $LINES
-    // (set by most shells) and finally to a sensible default.
-    let env_cols = std::env::var("COLUMNS").ok().and_then(|s| s.parse().ok());
-    let env_rows = std::env::var("LINES").ok().and_then(|s| s.parse().ok());
-    let (cols, rows) = match crossterm::terminal::size() {
-        Ok(s) => s,
-        Err(_) => (env_cols.unwrap_or(100), env_rows.unwrap_or(40)),
-    };
-    let cols = cols.max(60);
-    let rows = rows.max(20);
+    let (cols, rows) = detect_terminal_size();
     let extra = (cols as u64) | ((rows as u64) << 16);
 
-    if !bypass && !output_cache_bypass
-        && crate::output_cache::try_serve(period_str(period), provider, "rich", extra)
-    {
-        return Ok(());
-    }
+    render_with_output_cache(period, provider, "rich", extra, |pre_stats| {
+        // Pricing is lazy-loaded inside `get_model_costs` on first hit —
+        // cached calls already carry `cost_usd`, so the eager
+        // `load_pricing_sync()` shaved here only matters on a cache miss.
+        let mut app = App::new(period, provider);
+        // `detect_providers` reads the discovery cache and fills in
+        // `app.detected_providers`; without it `render_tabs` hides the
+        // "[p] all" provider label.
+        app.detect_providers();
 
-    load_pricing_sync();
+        let date_range = get_date_range(period_str(period));
+        let filter = if provider == "all" { None } else { Some(provider) };
+        app.projects = crate::parser::parse_all_sessions(Some(&date_range), filter, pre_stats)
+            .unwrap_or_default();
+        app.loading = false;
 
-    let mut app = App::new(period, provider);
-    app.detect_providers();
+        // Size the off-screen buffer to the dashboard's natural height so
+        // the one-shot view never needs to scroll.
+        let data = widgets::build_dashboard_data(&app.projects, app.current_period());
+        let dw = crate::tui::layout::dash_width(cols);
+        let wide = crate::tui::layout::is_wide(dw);
+        let bw = crate::tui::layout::bar_width(if wide { dw / 2 - 4 } else { dw - 4 });
+        let content_h = widgets::dashboard_natural_height(wide, cols, bw, &data);
+        // Tabs + header + content + status bar = 1 + 3 + content + 3.
+        let total_h = 1u16
+            .saturating_add(3)
+            .saturating_add(content_h)
+            .saturating_add(3)
+            .max(rows);
+        let area = ratatui::layout::Rect::new(0, 0, cols, total_h);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        widgets::render_into_buffer(&mut buf, area, &app, PERIODS);
 
-    let date_range = get_date_range(period_str(period));
-    let filter = if provider == "all" { None } else { Some(provider) };
-    let projects = parse_all_sessions(Some(&date_range), filter).unwrap_or_default();
-    app.projects = projects;
-    app.loading = false;
-
-    // Compute the natural dashboard height for this width so the buffer
-    // we allocate is exactly tall enough — no scrolling needed in the
-    // one-shot view.
-    let data = widgets::build_dashboard_data(&app.projects, app.current_period());
-    let dw = crate::tui::layout::dash_width(cols);
-    let wide = crate::tui::layout::is_wide(dw);
-    let bw = crate::tui::layout::bar_width(if wide { dw / 2 - 4 } else { dw - 4 });
-    let content_h = widgets::dashboard_natural_height(wide, cols, bw, &data);
-    // Tabs + header + content + status bar = 1 + 3 + content + 3.
-    let total_h = 1u16.saturating_add(3).saturating_add(content_h).saturating_add(3);
-    let total_h = total_h.max(rows);
-    let area = ratatui::layout::Rect::new(0, 0, cols, total_h);
-    let mut buf = ratatui::buffer::Buffer::empty(area);
-    widgets::render_into_buffer(&mut buf, area, &app, PERIODS);
-
-    let mut out: Vec<u8> = Vec::with_capacity((cols as usize) * (total_h as usize) * 4);
-    buffer_to_ansi(&buf, area, &mut out);
-
-    {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(&out);
-    }
-
-    crate::parser::join_pending_persists();
-    if !bypass && !output_cache_bypass {
-        crate::output_cache::store(period_str(period), provider, "rich", extra, &out);
-    }
-    Ok(())
+        let mut out: Vec<u8> = Vec::with_capacity((cols as usize) * (total_h as usize) * 4);
+        buffer_to_ansi(&buf, area, &mut out);
+        out
+    })
 }
 
 /// Walk a ratatui Buffer and emit ANSI escape sequences + cell contents
@@ -828,54 +893,23 @@ fn buffer_to_ansi(buf: &ratatui::buffer::Buffer, area: ratatui::layout::Rect, ou
 
 /// Fully synchronous non-TTY report — skips tokio entirely. Called by
 /// `main` when stdin isn't a terminal and the command is a
-/// report/today/month with no `--refresh`.
+/// report/today/month with no `--refresh`. Output is memoized through
+/// `render_with_output_cache`, so repeat invocations replay the stored
+/// bytes in <1 ms as long as no session file has changed.
 pub fn run_static_sync(period: Period, provider: &str) -> Result<()> {
-    let prof = std::env::var_os("CODEBURN_PROFILE").is_some();
-    let bypass = crate::parser::is_cache_bypassed();
-    // Pricing is lazy-loaded inside `get_model_costs`; the full-cache-hit
-    // path never calls it, so we skip the eager `load_pricing_sync` here.
-    let date_range = get_date_range(period_str(period));
-    let filter = if provider == "all" { None } else { Some(provider) };
-    let t_parse = Instant::now();
-    let agg = parse_all_sessions_static(Some(&date_range), filter).unwrap_or_default();
-    if prof {
-        eprintln!("[prof main] parse_all_sessions    {:>8.2} ms", t_parse.elapsed().as_secs_f64() * 1000.0);
-    }
-    let t_render = Instant::now();
-    // Render to a Vec so we can both print it and feed the output cache —
-    // the latter lets the next identical invocation skip the whole parse
-    // pipeline (see `output_cache::try_serve`).
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    render_static_aggregate_into(&mut buf, period, &agg);
-    {
-        use std::io::Write;
-        let _ = std::io::stdout().lock().write_all(&buf);
-    }
-    if prof {
-        eprintln!("[prof main] render_static         {:>8.2} ms", t_render.elapsed().as_secs_f64() * 1000.0);
-    }
-    // Drain any background persist threads (report cache + discovery cache
-    // writes). Detached `std::thread::spawn` threads are killed when `main`
-    // returns, so without this join the first run after deleting caches
-    // never actually writes anything back and every subsequent run looks
-    // like a full miss.
-    let t_join = Instant::now();
-    crate::parser::join_pending_persists();
-    if prof {
-        eprintln!("[prof main] join persists         {:>8.2} ms", t_join.elapsed().as_secs_f64() * 1000.0);
-    }
-    // Store the output cache AFTER report-cache.bin has been written.
-    // The fingerprint captures the report cache's mtime — if we computed
-    // it before the persist landed, the next run would see a different
-    // mtime and miss. Synchronous so the file is on disk when main returns.
-    //
-    // --no-output-cache skips both read (in main) and write (here) so
-    // benches measuring the parse pipeline aren't polluted by the
-    // store cost.
-    if !bypass && !crate::parser::is_output_cache_bypassed() {
-        crate::output_cache::store(period_str(period), provider, "static", 0, &buf);
-    }
-    Ok(())
+    render_with_output_cache(period, provider, "static", 0, |_pre_stats| {
+        // The static path's `parse_all_sessions_static` has its own cache
+        // read+write logic today; it doesn't accept pre-stats, so we don't
+        // forward the map. Wiring that through is a parser-side refactor
+        // orthogonal to this cleanup.
+        let date_range = get_date_range(period_str(period));
+        let filter = if provider == "all" { None } else { Some(provider) };
+        let agg = parse_all_sessions_static(Some(&date_range), filter).unwrap_or_default();
+
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        render_static_aggregate_into(&mut buf, period, &agg);
+        buf
+    })
 }
 
 fn render_static_aggregate_into<W: std::io::Write>(out: &mut W, period: Period, agg: &StaticAggregate) {
@@ -925,7 +959,7 @@ fn run_static(period: Period, provider: &str) -> Result<()> {
     } else {
         Some(provider)
     };
-    let projects = parse_all_sessions(Some(&date_range), filter)
+    let projects = parse_all_sessions(Some(&date_range), filter, &HashMap::new())
         .unwrap_or_default();
     render_static(period, &projects);
     Ok(())

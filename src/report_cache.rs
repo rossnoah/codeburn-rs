@@ -55,7 +55,7 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 
-use crate::types::ParsedProviderCall;
+use crate::types::{ParsedProviderCall, SessionSummary};
 
 const MAGIC: &[u8; 8] = b"CODEBRN1";
 // v3: added per-entry summary blob (compact pre-aggregated view) for fast
@@ -67,7 +67,12 @@ const MAGIC: &[u8; 8] = b"CODEBRN1";
 // passes date filters to providers ONLY in --no-cache mode. Earlier v4
 // caches written by the cached path may still hold pi/codex empty entries
 // from a "today" run, so they have to be discarded.
-const VERSION: u32 = 5;
+// v6: the main `blob` field is now `bincode(Vec<SessionSummary>)` — already
+// classified + aggregated — instead of the raw `Vec<ParsedProviderCall>`.
+// Cuts the hot path by skipping bincode-deserialise of ~100 MB of per-call
+// Strings + classify_turn for ~20k turns on every run. Old v5 caches hold
+// raw-call blobs whose shape no longer matches, so we have to reject them.
+const VERSION: u32 = 6;
 
 fn cache_path() -> PathBuf {
     dirs::home_dir()
@@ -154,9 +159,12 @@ impl CacheSnapshot {
         }
     }
 
-    /// Decode the cached calls for `entry`. Typically called inside a rayon
-    /// `par_iter` so many blobs decode simultaneously.
-    pub fn decode(&self, entry: &EntryHeader) -> Option<Vec<ParsedProviderCall>> {
+    /// Decode the cached session summaries for `entry`. Each source's
+    /// `Vec<SessionSummary>` is pre-classified at the miss-parse side, so the
+    /// cached-hit path can skip both the raw-call bincode decode and the
+    /// `classify_turn` / `build_session_summary` work. Typically called
+    /// inside a rayon `par_iter` so many blobs decode simultaneously.
+    pub fn decode(&self, entry: &EntryHeader) -> Option<Vec<SessionSummary>> {
         let blob = self.blob(entry);
         bincode::deserialize(blob).ok()
     }
@@ -339,11 +347,15 @@ fn write_entry(buf: &mut Vec<u8>, key: &str, project: &str, mtime: u64, size: u6
     buf.extend_from_slice(blob);
 }
 
-/// Helper: serialise a `Vec<ParsedProviderCall>` to bincode bytes. Callers
-/// store the result into a `NewEntry.blob`.
-pub fn encode_calls(calls: &[ParsedProviderCall]) -> Vec<u8> {
-    bincode::serialize(calls).unwrap_or_default()
+/// Helper: serialise a `Vec<SessionSummary>` to bincode bytes. Callers
+/// store the result into a `NewEntry.blob`. The summaries are the already-
+/// classified / aggregated per-session data for one source, so the cached-
+/// hit read path skips both `classify_turn` and the full per-call bincode
+/// deserialize.
+pub fn encode_session_summaries(sessions: &[SessionSummary]) -> Vec<u8> {
+    bincode::serialize(sessions).unwrap_or_default()
 }
+
 
 /// Pre-aggregate the calls of one source into a packed summary blob. The
 /// static report path iterates these blobs without any String allocation

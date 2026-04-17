@@ -23,6 +23,12 @@
 //! The fingerprint covers everything that can change the output:
 //!   - mtime of `report-cache.bin` (any new parse miss bumps it)
 //!   - mtime of `discovery.bin`    (any new/deleted source bumps it)
+//!   - session-files signature     (hash of every known session file's
+//!                                  mtime + size — catches appends to an
+//!                                  existing session jsonl while the user
+//!                                  keeps working in Claude / Cursor / etc.
+//!                                  between runs, which don't bump the
+//!                                  discovery-dir mtimes)
 //!   - today's local date          (period windows shift at the day boundary)
 //!   - period + provider filter
 //!
@@ -88,7 +94,11 @@ fn today_local_packed() -> u64 {
 /// `extra` lets format-specific renderers fold things like terminal size
 /// into the fingerprint — for the rich dashboard a different `cols` /
 /// `rows` would produce different bytes, so the cache must invalidate.
-fn fingerprint(period: &str, provider: &str, format: &str, extra: u64) -> u64 {
+/// `session_sig` is the `u64` hash of every known session file's
+/// `(path, mtime, size)` triple (see `parser::stat_all_sources`) — this
+/// is what catches in-place appends to existing jsonl files when the
+/// user keeps working in Claude / Cursor / etc. between runs.
+fn fingerprint(period: &str, provider: &str, format: &str, extra: u64, session_sig: u64) -> u64 {
     let (rep_mtime, rep_size) = meta(&report_cache_path());
     let (disc_mtime, disc_size) = meta(&discovery_cache_path());
     let day = today_local_packed();
@@ -105,6 +115,7 @@ fn fingerprint(period: &str, provider: &str, format: &str, extra: u64) -> u64 {
     h.write_u64(rep_size);
     h.write_u64(disc_mtime);
     h.write_u64(disc_size);
+    h.write_u64(session_sig);
     // Bake the cache file format version into the fingerprint so a binary
     // with a changed renderer can never serve stale output from before
     // its upgrade.
@@ -112,11 +123,16 @@ fn fingerprint(period: &str, provider: &str, format: &str, extra: u64) -> u64 {
     h.finish()
 }
 
-const VERSION: u32 = 2;
+// Bumped to 3: fingerprint now folds in a session-files signature so
+// in-place appends to existing jsonl files correctly invalidate.
+const VERSION: u32 = 3;
 
 /// Try to serve the report straight from a previous run's cached output.
 /// Returns `true` if a hit was found and printed; the caller should exit.
-pub fn try_serve(period: &str, provider: &str, format: &str, extra: u64) -> bool {
+/// `session_sig` is the caller's freshly-computed session-files signature
+/// (see `parser::stat_all_sources`) — it's the only piece of the
+/// fingerprint that catches in-place appends to a session jsonl.
+pub fn try_serve(period: &str, provider: &str, format: &str, extra: u64, session_sig: u64) -> bool {
     let path = output_cache_path(period, provider, format);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -136,7 +152,7 @@ pub fn try_serve(period: &str, provider: &str, format: &str, extra: u64) -> bool
     if 12 + len > bytes.len() {
         return false;
     }
-    let want_fp = fingerprint(period, provider, format, extra);
+    let want_fp = fingerprint(period, provider, format, extra, session_sig);
     if stored_fp != want_fp {
         return false;
     }
@@ -146,8 +162,8 @@ pub fn try_serve(period: &str, provider: &str, format: &str, extra: u64) -> bool
 
 /// Persist the rendered output keyed on the current fingerprint. Called
 /// after a fresh compute so the next identical run can hit `try_serve`.
-pub fn store(period: &str, provider: &str, format: &str, extra: u64, output: &[u8]) {
-    let fp = fingerprint(period, provider, format, extra);
+pub fn store(period: &str, provider: &str, format: &str, extra: u64, session_sig: u64, output: &[u8]) {
+    let fp = fingerprint(period, provider, format, extra, session_sig);
     let path = output_cache_path(period, provider, format);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

@@ -63,6 +63,64 @@ fn unsanitize_path(dir_name: &str) -> String {
     dir_name.replace('-', "/")
 }
 
+/// Compute cache-invalidation metadata for every known source and fold
+/// the results into a single `u64` hash plus a per-path `(mtime, size)`
+/// map. The hash is the output cache's "session-files signature" — any
+/// change to any source file flips one of the mtimes, flips the hash,
+/// invalidates the memoized output. The per-path map is reused as
+/// `pre_stats` in `parse_all_sessions` when the output cache misses so
+/// we don't pay for the stat fanout twice.
+///
+/// This dispatches through each provider's `cache_metadata` — same logic
+/// the parse cache uses in `partition_cache`, so the invalidation rule is
+/// symmetric with the parse cache:
+///   - jsonl providers (claude / codex / pi / copilot): stat the jsonl
+///   - cursor: stat the cursor SQLite DB
+///   - opencode: stat the opencode SQLite DB (186 sessions collapse to
+///     one real stat via `DB_META_CACHE`)
+///
+/// Any file the parse cache would consider "changed" is one this
+/// signature also catches — there's no correctness gap between the two
+/// layers.
+pub fn stat_all_sources() -> (HashMap<String, (u64, u64)>, u64) {
+    use std::hash::Hasher;
+    let cache = match crate::discovery_cache::load() {
+        Some(c) => c,
+        None => return (HashMap::new(), 0),
+    };
+    let providers = get_all_providers();
+    let provider_by_name: HashMap<&str, &Box<dyn Provider>> =
+        providers.iter().map(|p| (p.name(), p)).collect();
+
+    let all_sources: Vec<SessionSource> = cache
+        .sources
+        .into_values()
+        .flat_map(|srcs| srcs.into_iter())
+        .collect();
+
+    let results: Vec<(String, (u64, u64))> = all_sources
+        .par_iter()
+        .filter_map(|s| {
+            let provider = provider_by_name.get(s.provider.as_str())?;
+            let meta = provider.cache_metadata(s)?;
+            Some((s.path.clone(), meta))
+        })
+        .collect();
+
+    // Sort for stable hash regardless of rayon collect order.
+    let mut sorted = results.clone();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = rustc_hash::FxHasher::default();
+    for (path, (mtime, size)) in &sorted {
+        h.write(path.as_bytes());
+        h.write_u64(*mtime);
+        h.write_u64(*size);
+    }
+    let sig = h.finish();
+    let map: HashMap<String, (u64, u64)> = results.into_iter().collect();
+    (map, sig)
+}
+
 fn provider_call_to_api_call(call: &ParsedProviderCall) -> ParsedApiCall {
     let usage = TokenUsage {
         input_tokens: call.input_tokens,
@@ -289,32 +347,6 @@ fn build_session_summary(
     }
 }
 
-fn filter_by_date_range<'a>(calls: &'a [ParsedProviderCall], date_range: Option<&DateRange>) -> Vec<&'a ParsedProviderCall> {
-    match date_range {
-        None => calls.iter().collect(),
-        Some(dr) => {
-            // JSONL timestamps are UTC, so convert date range to UTC for comparison.
-            let start_str = dr.start.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%dT%H:%M:%S").to_string();
-            let end_str = dr.end.with_timezone(&chrono::Utc)
-                .format("%Y-%m-%dT%H:%M:%S").to_string();
-            calls
-                .iter()
-                .filter(|c| {
-                    if c.timestamp.is_empty() {
-                        return true;
-                    }
-                    let ts = &c.timestamp;
-                    if ts.len() < 19 {
-                        return true;
-                    }
-                    let prefix = &ts[..19];
-                    prefix >= start_str.as_str() && prefix <= end_str.as_str()
-                })
-                .collect()
-        }
-    }
-}
 
 // ── parse_all_sessions pipeline ────────────────────────────────────────
 //
@@ -375,19 +407,23 @@ fn partition_cache<'a>(
     snapshot: &'a CacheSnapshot,
     all_sources: &[SessionSource],
     provider_by_name: &HashMap<&str, &Box<dyn Provider>>,
+    pre_stats: &HashMap<String, (u64, u64)>,
     bypass: bool,
 ) -> CachePartition<'a> {
-    // Kick every source's `cache_metadata` stat call in parallel — it's
-    // ~1443 independent `stat(2)`s on the hot path, and the serial version
-    // was eating 3-4 ms. Results are pairs of (source idx, optional meta).
-    // `miss_count` is the total number of source indices that didn't hit
-    // cache, including sources with no metadata (which we can't cache).
+    // Most sources are in the snapshot from the last run, so their stat
+    // results may already have been computed (e.g. by `stat_all_sources`
+    // for the output-cache fingerprint). Look those up from `pre_stats`
+    // first; fall through to the provider's `cache_metadata` dispatch
+    // only for fresh sources or ones the caller didn't pre-stat.
+    // Callers that don't have pre-stats pass `&HashMap::new()`.
     let per_source: Vec<(usize, Option<(u64, u64)>)> = all_sources
         .par_iter()
         .enumerate()
         .map(|(i, source)| {
             let meta = if bypass {
                 None
+            } else if let Some(m) = pre_stats.get(source.path.as_str()) {
+                Some(*m)
             } else {
                 provider_by_name
                     .get(source.provider.as_str())
@@ -427,10 +463,10 @@ fn partition_cache<'a>(
 fn decode_cache_hits(
     snapshot: &CacheSnapshot,
     hits: &[(&EntryHeader, String)],
-) -> Vec<(String, Vec<ParsedProviderCall>)> {
+) -> Vec<(String, Vec<SessionSummary>)> {
     hits.par_iter()
         .filter_map(|(entry, project)| {
-            snapshot.decode(entry).map(|calls| (project.clone(), calls))
+            snapshot.decode(entry).map(|sessions| (project.clone(), sessions))
         })
         .collect()
 }
@@ -486,28 +522,30 @@ fn parse_misses(
 fn spawn_persist(
     snapshot: CacheSnapshot,
     miss_meta: &HashMap<String, (u64, u64, String)>,
-    miss_results: &[(String, String, Vec<ParsedProviderCall>)],
+    miss_summaries_by_source: &HashMap<String, Vec<SessionSummary>>,
+    miss_calls_by_source: &HashMap<String, Vec<ParsedProviderCall>>,
 ) {
     if miss_meta.is_empty() {
         return;
     }
-    let mut by_source: HashMap<&str, &[ParsedProviderCall]> =
-        HashMap::with_capacity(miss_results.len());
-    for (source_path, _project, calls) in miss_results {
-        by_source.insert(source_path.as_str(), calls.as_slice());
-    }
     let fresh: Vec<NewEntry> = miss_meta
         .par_iter()
         .map(|(source_path, (mtime, size, project))| {
-            let empty: &[ParsedProviderCall] = &[];
-            let calls = by_source.get(source_path.as_str()).copied().unwrap_or(empty);
+            let empty_calls: Vec<ParsedProviderCall> = Vec::new();
+            let empty_sessions: Vec<SessionSummary> = Vec::new();
+            let calls = miss_calls_by_source
+                .get(source_path.as_str())
+                .unwrap_or(&empty_calls);
+            let sessions = miss_summaries_by_source
+                .get(source_path.as_str())
+                .unwrap_or(&empty_sessions);
             NewEntry {
                 key: source_path.clone(),
                 mtime: *mtime,
                 size: *size,
                 project: project.clone(),
                 summary: crate::report_cache::encode_summary(calls),
-                blob: crate::report_cache::encode_calls(calls),
+                blob: crate::report_cache::encode_session_summaries(sessions),
             }
         })
         .collect();
@@ -539,41 +577,149 @@ pub fn join_pending_persists() {
     }
 }
 
-fn classify_and_summarize(
-    source_calls: &[(String, Vec<ParsedProviderCall>)],
+/// Classify + aggregate one source's raw calls into `Vec<SessionSummary>`.
+/// Runs without any date filter — the result is what gets bincode'd into the
+/// persistent cache. Downstream callers filter by date range at render time
+/// via [`filter_session_for_range`].
+fn build_source_summaries(
+    project: &str,
+    calls: &[ParsedProviderCall],
+) -> Vec<SessionSummary> {
+    let mut sess_calls: HashMap<String, Vec<&ParsedProviderCall>> = HashMap::new();
+    for call in calls {
+        sess_calls
+            .entry(call.session_id.clone())
+            .or_default()
+            .push(call);
+    }
+
+    let mut summaries: Vec<SessionSummary> = Vec::with_capacity(sess_calls.len());
+    for (session_id, mut session_calls) in sess_calls {
+        session_calls.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        let turns = group_calls_into_turns(&session_calls);
+        let classified: Vec<ClassifiedTurn> =
+            turns.into_iter().map(classify_turn).collect();
+        let s = build_session_summary(&session_id, project, &classified);
+        if s.api_calls > 0 {
+            summaries.push(s);
+        }
+    }
+    summaries
+}
+
+/// Trim a cached `SessionSummary` down to the calls that fall within
+/// `date_range`. The returned summary has:
+/// - `daily_costs` restricted to in-range UTC days.
+/// - totals derived from those filtered days (cost / tokens / call count).
+/// Session-level breakdowns (`model_breakdown`, `tool_breakdown`,
+/// `bash_breakdown`, `mcp_breakdown`, `category_breakdown`) are carried
+/// through unchanged — for sessions that straddle the period boundary this
+/// can include contributions from out-of-range calls. In practice sessions
+/// are short-lived so the overlap is tiny; the dashboard totals (which come
+/// from the filtered daily_costs) stay exact.
+///
+/// Returns `None` when no day of the session falls in range. Consumes `s`
+/// so the HashMap breakdowns can be moved (not cloned) into the output.
+fn filter_session_for_range(
+    s: SessionSummary,
+    start_day: &str,
+    end_day: &str,
+) -> Option<SessionSummary> {
+    // Quick path: whole session is outside the range. `first_timestamp` /
+    // `last_timestamp` are UTC 19-char prefixes; start/end are UTC "YYYY-MM-DD"
+    // days extracted from the caller's range.
+    if !s.last_timestamp.is_empty() && s.last_timestamp.as_str() < start_day {
+        return None;
+    }
+    let end_upper = end_day_upper_bound(end_day);
+    if !s.first_timestamp.is_empty() && s.first_timestamp.as_str() > end_upper.as_str() {
+        return None;
+    }
+
+    // Retain in-range days in place; bail if none match so we skip the move
+    // cost of breakdown HashMaps below.
+    let mut s = s;
+    s.daily_costs.retain(|d| d.day.as_str() >= start_day && d.day.as_str() <= end_day);
+    if s.daily_costs.is_empty() {
+        return None;
+    }
+    s.daily_costs.sort_by(|a, b| a.day.cmp(&b.day));
+
+    let mut total_cost = 0.0f64;
+    let mut api_calls = 0u64;
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_cache_write = 0u64;
+    for d in &s.daily_costs {
+        total_cost += d.cost_usd;
+        api_calls += d.call_count;
+        total_input += d.input_tokens;
+        total_output += d.output_tokens;
+        total_cache_read += d.cache_read_tokens;
+        total_cache_write += d.cache_write_tokens;
+    }
+    if api_calls == 0 {
+        return None;
+    }
+
+    s.total_cost_usd = total_cost;
+    s.api_calls = api_calls;
+    s.total_input_tokens = total_input;
+    s.total_output_tokens = total_output;
+    s.total_cache_read_tokens = total_cache_read;
+    s.total_cache_write_tokens = total_cache_write;
+    Some(s)
+}
+
+/// `end_day` is a "YYYY-MM-DD" string — to compare against a 19-char timestamp
+/// prefix we need "YYYY-MM-DDT23:59:59" (or anything lexically >= the max
+/// in-day prefix). Returning "YYYY-MM-DDZ" works since 'Z' > 'T' > digits so
+/// any in-day ts prefix sorts below it.
+fn end_day_upper_bound(end_day: &str) -> String {
+    // "2026-04-17" → "2026-04-17Z"  (Z sorts above any "T…" suffix)
+    let mut s = String::with_capacity(end_day.len() + 1);
+    s.push_str(end_day);
+    s.push('Z');
+    s
+}
+
+/// Group cached session summaries (and fresh miss summaries) by project,
+/// filtering each by the requested `date_range` — the read-time replacement
+/// for the old `classify_and_summarize` pass. No bincode decode of raw calls,
+/// no `classify_turn` on previously-seen turns.
+fn merge_and_filter_sessions(
+    hit_sessions: Vec<(String, Vec<SessionSummary>)>,
+    miss_sessions: Vec<(String, Vec<SessionSummary>)>,
     date_range: Option<&DateRange>,
 ) -> HashMap<String, Vec<SessionSummary>> {
-    // Each source's calls are independent once date-filtered, so map in
-    // parallel: source → Vec<SessionSummary>, then merge by project. With
-    // the disk cache on, this loop is the last thing gating the TUI.
-    let per_source: Vec<(String, Vec<SessionSummary>)> = source_calls
-        .par_iter()
-        .map(|(project, calls)| {
-            let filtered = filter_by_date_range(calls, date_range);
+    let (start_day, end_day) = match date_range {
+        Some(dr) => (
+            dr.start
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d")
+                .to_string(),
+            dr.end
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%d")
+                .to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+    let filter_active = !start_day.is_empty();
 
-            // Bucket by session so each session's calls can be sorted
-            // chronologically before we group consecutive same-user-message
-            // calls into turns (matches JS `groupIntoTurns`).
-            let mut sess_calls: HashMap<String, Vec<&ParsedProviderCall>> = HashMap::new();
-            for call in filtered {
-                sess_calls
-                    .entry(call.session_id.clone())
-                    .or_default()
-                    .push(call);
+    let per_source: Vec<(String, Vec<SessionSummary>)> = hit_sessions
+        .into_par_iter()
+        .chain(miss_sessions.into_par_iter())
+        .map(|(project, sessions)| {
+            if !filter_active {
+                return (project, sessions);
             }
-
-            let mut summaries: Vec<SessionSummary> = Vec::with_capacity(sess_calls.len());
-            for (session_id, mut session_calls) in sess_calls {
-                session_calls.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-                let turns = group_calls_into_turns(&session_calls);
-                let classified: Vec<ClassifiedTurn> =
-                    turns.into_iter().map(classify_turn).collect();
-                let s = build_session_summary(&session_id, project, &classified);
-                if s.api_calls > 0 {
-                    summaries.push(s);
-                }
-            }
-            (project.clone(), summaries)
+            let filtered: Vec<SessionSummary> = sessions
+                .into_iter()
+                .filter_map(|s| filter_session_for_range(s, &start_day, &end_day))
+                .collect();
+            (project, filtered)
         })
         .collect();
 
@@ -678,7 +824,7 @@ pub fn parse_all_sessions_static(
     let provider_by_name: HashMap<&str, &Box<dyn Provider>> =
         providers.iter().map(|p| (p.name(), p)).collect();
     let CachePartition { hits, misses_by_provider, miss_meta, miss_count } =
-        partition_cache(&snapshot, &all_sources, &provider_by_name, bypass);
+        partition_cache(&snapshot, &all_sources, &provider_by_name, &HashMap::new(), bypass);
     prof_log("cache partition", t_partition);
     if *PROF {
         eprintln!(
@@ -716,7 +862,20 @@ pub fn parse_all_sessions_static(
 
     let t_persist = Instant::now();
     if !bypass {
-        spawn_persist(snapshot.clone(), &miss_meta, &miss_results);
+        // Build per-source SessionSummary list for each miss so the cache
+        // write path stores pre-classified rows (matches parse_all_sessions).
+        let miss_summaries: HashMap<String, Vec<SessionSummary>> = miss_results
+            .par_iter()
+            .map(|(source_path, project, calls)| {
+                (source_path.clone(), build_source_summaries(project, calls))
+            })
+            .collect();
+        let mut by_calls: HashMap<String, Vec<ParsedProviderCall>> =
+            HashMap::with_capacity(miss_results.len());
+        for (source_path, _project, calls) in &miss_results {
+            by_calls.insert(source_path.clone(), calls.clone());
+        }
+        spawn_persist(snapshot.clone(), &miss_meta, &miss_summaries, &by_calls);
     }
     prof_log("cache persist compose", t_persist);
 
@@ -887,140 +1046,43 @@ fn aggregate_static_from_summary(
     }
 }
 
-#[allow(dead_code)]
-fn aggregate_static(
-    source_views: &[(&str, &[ParsedProviderCall])],
-    date_range: Option<&DateRange>,
-) -> StaticAggregate {
-    let (start, end) = match date_range {
-        Some(dr) => (
-            dr.start
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string(),
-            dr.end
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%dT%H:%M:%S")
-                .to_string(),
-        ),
-        None => (String::new(), String::new()),
-    };
-
-    #[derive(Default)]
-    struct ProjectAcc {
-        cost: f64,
-        calls: u64,
-        input: u64,
-        output: u64,
-        cache_read: u64,
-        cache_write: u64,
-        sessions: std::collections::HashSet<String>,
-    }
-
-    // Map per source → its (project_path, ProjectAcc). Parallel over sources,
-    // then reduce by project at the end.
-    let per_source: Vec<(String, ProjectAcc)> = source_views
-        .par_iter()
-        .map(|(project, calls)| {
-            let mut acc = ProjectAcc::default();
-            for call in *calls {
-                if !start.is_empty() && !call.timestamp.is_empty() && call.timestamp.len() >= 19 {
-                    let prefix = &call.timestamp[..19];
-                    if prefix < start.as_str() || prefix > end.as_str() {
-                        continue;
-                    }
-                }
-                acc.cost += call.cost_usd;
-                acc.calls += 1;
-                acc.input += call.input_tokens;
-                acc.output += call.output_tokens;
-                acc.cache_read += call.cache_read_input_tokens;
-                acc.cache_write += call.cache_creation_input_tokens;
-                if !call.session_id.is_empty() {
-                    acc.sessions.insert(call.session_id.clone());
-                }
-            }
-            (project.to_string(), acc)
-        })
-        .collect();
-
-    let mut by_project: HashMap<String, ProjectAcc> = HashMap::new();
-    let mut global_sessions: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut total_input = 0u64;
-    let mut total_output = 0u64;
-    let mut total_cache_read = 0u64;
-    let mut total_cache_write = 0u64;
-    for (project, acc) in per_source {
-        total_input += acc.input;
-        total_output += acc.output;
-        total_cache_read += acc.cache_read;
-        total_cache_write += acc.cache_write;
-        for s in &acc.sessions {
-            global_sessions.insert(s.clone());
-        }
-        let entry = by_project.entry(project).or_default();
-        entry.cost += acc.cost;
-        entry.calls += acc.calls;
-        for s in acc.sessions {
-            entry.sessions.insert(s);
-        }
-    }
-
-    let mut projects: Vec<StaticProjectAggregate> = by_project
-        .into_iter()
-        .filter(|(_, a)| a.calls > 0)
-        .map(|(p, a)| StaticProjectAggregate {
-            project_path: unsanitize_path(&p),
-            total_cost_usd: a.cost,
-            total_api_calls: a.calls,
-        })
-        .collect();
-    projects.sort_by(|a, b| {
-        b.total_cost_usd
-            .partial_cmp(&a.total_cost_usd)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.project_path.cmp(&b.project_path))
-    });
-
-    StaticAggregate {
-        projects,
-        total_sessions: global_sessions.len(),
-        total_input,
-        total_output,
-        total_cache_read,
-        total_cache_write,
-    }
-}
-
+/// Parse every discovered session into `Vec<ProjectSummary>`, using the
+/// cache for any source whose `(mtime, size)` matches.
+///
+/// `pre_stats` is an optional pre-computed `source_path → (mtime, size)`
+/// map that the caller may have built already (see `stat_all_sources`
+/// for the output-cache path). Pass `&HashMap::new()` when you don't
+/// have one — `partition_cache` falls through to the provider's
+/// `cache_metadata` dispatch for any source missing from the map.
 pub fn parse_all_sessions(
     date_range: Option<&DateRange>,
     provider_filter: Option<&str>,
+    pre_stats: &HashMap<String, (u64, u64)>,
 ) -> Result<Vec<ProjectSummary>> {
     let bypass = is_cache_bypassed();
 
     let t0 = Instant::now();
     let seen_keys: DashSet<String> = DashSet::new();
 
-    // Load the cache snapshot *before* discovery so providers can use its
-    // path→project map to skip expensive per-file validation on already-seen
-    // files (see codex's `discover_sessions_with_hints`).
+    // Snapshot load and discovery walk are independent — running them on
+    // two rayon threads shaves a few hundred µs off the sequential version
+    // on a warm cache. (Hints for codex discovery are derived from the
+    // on-disk discovery cache when present; passing None here is fine
+    // because that path is already short-circuited by the discovery cache.)
     let t_cache_load = Instant::now();
-    let snapshot = if bypass {
-        CacheSnapshot::empty()
-    } else {
-        CacheSnapshot::load()
-    };
+    let provider_filter_owned = provider_filter.map(|s| s.to_string());
+    let (snapshot, discovered_pre) = rayon::join(
+        || if bypass { CacheSnapshot::empty() } else { CacheSnapshot::load() },
+        || {
+            crate::providers::discover_all_sessions_with_hints(
+                provider_filter_owned.as_deref(),
+                None,
+            )
+        },
+    );
     prof_log("cache snapshot load", t_cache_load);
 
-    let discover_hints: HashMap<String, String> = snapshot
-        .iter()
-        .map(|(k, h)| (k.to_string(), h.project.clone()))
-        .collect();
-    let all_sources = crate::providers::discover_all_sessions_with_hints(
-        provider_filter,
-        Some(&discover_hints),
-    )?;
+    let all_sources = discovered_pre?;
     prof_log("discover_all_sessions", t0);
 
     let t1 = Instant::now();
@@ -1038,7 +1100,7 @@ pub fn parse_all_sessions(
     let provider_by_name: HashMap<&str, &Box<dyn Provider>> =
         providers.iter().map(|p| (p.name(), p)).collect();
     let CachePartition { hits, misses_by_provider, miss_meta, miss_count } =
-        partition_cache(&snapshot, &all_sources, &provider_by_name, bypass);
+        partition_cache(&snapshot, &all_sources, &provider_by_name, pre_stats, bypass);
     prof_log("cache partition", t_partition);
     if *PROF {
         eprintln!(
@@ -1050,7 +1112,7 @@ pub fn parse_all_sessions(
     }
 
     let t_decode = Instant::now();
-    let hit_calls = decode_cache_hits(&snapshot, &hits);
+    let hit_sessions = decode_cache_hits(&snapshot, &hits);
     prof_log("cache decode hits", t_decode);
 
     // Providers return `(source_path, project, calls)` so each miss maps
@@ -1074,35 +1136,61 @@ pub fn parse_all_sessions(
     );
     prof_log("parallel provider parse", t_parse);
 
-    // Combine hits + misses into the flat `(project, calls)` shape the
-    // downstream post-processing expects.
-    let source_calls: Vec<(String, Vec<ParsedProviderCall>)> = hit_calls
-        .into_iter()
-        .chain(
-            miss_results
-                .iter()
-                .map(|(_, project, calls)| (project.clone(), calls.clone())),
-        )
+    // Classify + aggregate miss results per source so we can (a) cache the
+    // pre-classified summaries and (b) feed them into the same downstream
+    // pipeline as cache hits. Misses are typically 1 source (the active
+    // session being written), so this stays cheap.
+    let t_miss_cls = Instant::now();
+    let miss_summaries_per_source: Vec<(String, String, Vec<SessionSummary>)> = miss_results
+        .par_iter()
+        .map(|(source_path, project, calls)| {
+            let summaries = build_source_summaries(project, calls);
+            (source_path.clone(), project.clone(), summaries)
+        })
         .collect();
+    prof_log("miss classify", t_miss_cls);
 
     let t_persist_compose = Instant::now();
     if !bypass {
-        spawn_persist(snapshot.clone(), &miss_meta, &miss_results);
+        let mut by_summary: HashMap<String, Vec<SessionSummary>> =
+            HashMap::with_capacity(miss_summaries_per_source.len());
+        for (source_path, _project, summaries) in &miss_summaries_per_source {
+            by_summary.insert(source_path.clone(), summaries.clone());
+        }
+        let mut by_calls: HashMap<String, Vec<ParsedProviderCall>> =
+            HashMap::with_capacity(miss_results.len());
+        for (source_path, _project, calls) in &miss_results {
+            by_calls.insert(source_path.clone(), calls.clone());
+        }
+        spawn_persist(snapshot.clone(), &miss_meta, &by_summary, &by_calls);
     }
     prof_log("cache persist compose", t_persist_compose);
 
     if *PROF {
-        let total_calls: usize = source_calls.iter().map(|(_, c)| c.len()).sum();
-        eprintln!("[prof] sources={} total_calls={}", source_calls.len(), total_calls);
+        let total_sessions: usize = hit_sessions.iter().map(|(_, s)| s.len()).sum::<usize>()
+            + miss_summaries_per_source.iter().map(|(_, _, s)| s.len()).sum::<usize>();
+        eprintln!("[prof] sources={} total_sessions={}", hits.len() + miss_meta.len(), total_sessions);
     }
 
+    let miss_sessions: Vec<(String, Vec<SessionSummary>)> = miss_summaries_per_source
+        .into_iter()
+        .map(|(_, project, sessions)| (project, sessions))
+        .collect();
+
     let t_post = Instant::now();
-    let project_map = classify_and_summarize(&source_calls, date_range);
+    let project_map = merge_and_filter_sessions(hit_sessions, miss_sessions, date_range);
     prof_log("parallel post-processing", t_post);
 
     let t_finalize = Instant::now();
     let result = finalize_projects(project_map);
     prof_log("finalize/sort", t_finalize);
+
+    // Drop the miss_results Vec<ParsedProviderCall> off the hot path — the
+    // per-call Strings take a few ms to free. We've already extracted what we
+    // need (summaries + encoded blobs).
+    std::thread::spawn(move || {
+        drop(miss_results);
+    });
 
     prof_log("TOTAL parse_all_sessions", t0);
 

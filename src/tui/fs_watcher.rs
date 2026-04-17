@@ -30,7 +30,13 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// periodically; [`FsWatcher::poll_changed`] returns `true` only when a new
 /// mtime has been observed since the last poll (rate-limited by
 /// [`POLL_INTERVAL`]).
+///
+/// Construction is lazy — [`FsWatcher::new`] does no I/O. The initial
+/// baseline mtime is stat'd on the first `poll_changed` call that actually
+/// runs (after the rate-limit window elapses), so the one-shot non-TTY
+/// render path — which constructs an App but never polls — pays nothing.
 pub struct FsWatcher {
+    baseline_taken: bool,
     last_mtime: Option<SystemTime>,
     last_poll: Instant,
 }
@@ -38,7 +44,8 @@ pub struct FsWatcher {
 impl FsWatcher {
     pub fn new() -> Self {
         FsWatcher {
-            last_mtime: max_activity_mtime(),
+            baseline_taken: false,
+            last_mtime: None,
             last_poll: Instant::now(),
         }
     }
@@ -48,6 +55,7 @@ impl FsWatcher {
     /// reparse on its next poll.
     pub fn resync(&mut self) {
         self.last_mtime = max_activity_mtime();
+        self.baseline_taken = true;
     }
 
     /// Check for fresh session data. Respects the rate limit — returns
@@ -60,6 +68,13 @@ impl FsWatcher {
         }
         self.last_poll = Instant::now();
         let current = max_activity_mtime();
+        if !self.baseline_taken {
+            // Lazy initialisation — first real poll seeds the baseline
+            // without signaling a change. Subsequent polls can compare.
+            self.last_mtime = current;
+            self.baseline_taken = true;
+            return false;
+        }
         if current != self.last_mtime && current.is_some() {
             self.last_mtime = current;
             true

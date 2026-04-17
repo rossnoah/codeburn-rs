@@ -77,28 +77,8 @@ fn main() -> Result<()> {
     let stdin_tty = std::io::stdin().is_terminal();
     if !stdin_tty && static_only && !full_static {
         if let Some((period, provider)) = static_report_params(&command) {
-            // Output memoization: when neither the report cache nor the
-            // discovery cache has changed since the last run, we know the
-            // rendered output would be byte-identical. Replay it straight
-            // to stdout (~1 ms) and skip the whole parse pipeline.
-            // --no-cache and --no-output-cache both bypass this.
-            if !cli.no_cache && !cli.no_output_cache {
-                let period_str = match period {
-                    cli::Period::Today => "today",
-                    cli::Period::Week => "week",
-                    cli::Period::ThirtyDays => "30days",
-                    cli::Period::Month => "month",
-                };
-                if output_cache::try_serve(period_str, &provider, "static", 0) {
-                    if prof {
-                        eprintln!(
-                            "[prof main] output-cache hit       {:>8.2} ms",
-                            t_start.elapsed().as_secs_f64() * 1000.0,
-                        );
-                    }
-                    return Ok(());
-                }
-            }
+            // `run_static_sync` memoizes output via `render_with_output_cache`,
+            // which handles the fingerprint check + replay internally.
             return tui::run_static_sync(period, &provider);
         }
     }

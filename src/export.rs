@@ -136,18 +136,19 @@ pub async fn run_export(format: ExportFormat, output: Option<String>, provider: 
         Some(provider)
     };
 
+    let empty_prestats = std::collections::HashMap::new();
     let periods = vec![
         PeriodExport {
             label: "Today".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("today")), pf)?,
+            projects: parse_all_sessions(Some(&get_date_range("today")), pf, &empty_prestats)?,
         },
         PeriodExport {
             label: "7 Days".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("week")), pf)?,
+            projects: parse_all_sessions(Some(&get_date_range("week")), pf, &empty_prestats)?,
         },
         PeriodExport {
             label: "30 Days".to_string(),
-            projects: parse_all_sessions(Some(&get_date_range("30days")), pf)?,
+            projects: parse_all_sessions(Some(&get_date_range("30days")), pf, &empty_prestats)?,
         },
     ];
 
