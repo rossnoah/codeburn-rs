@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Benchmark the Rust `codeburn` binary against the published JS version
+# Benchmark the Rust `cburn` binary against the published JS version
 # (via `npx codeburn`). Uses hyperfine and reports means + the speedup ratio.
 #
 # Each run starts with the cursor disk cache cleared (`--prepare`) so both
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-RUST_BIN="$(cd "$(dirname "$0")" && pwd)/target/release/codeburn"
+RUST_BIN="$(cd "$(dirname "$0")" && pwd)/target/release/cburn"
 
 if [ ! -x "$RUST_BIN" ]; then
   echo "building release binary..." >&2

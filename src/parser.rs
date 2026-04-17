@@ -885,7 +885,7 @@ pub fn parse_all_sessions_static(
 
     // Drop the ~30 k ParsedProviderCall vectors off the hot path — their
     // combined String fields take ~4 ms to deallocate, which we don't want
-    // the user's `codeburn report` to wait on. We've already extracted every
+    // the user's `cburn report` to wait on. We've already extracted every
     // number we need into `agg`.
     std::thread::spawn(move || {
         drop(miss_results);
@@ -1197,7 +1197,7 @@ pub fn parse_all_sessions(
     Ok(result)
 }
 
-/// Fast path for `codeburn status`: computes only aggregate cost/call data.
+/// Fast path for `cburn status`: computes only aggregate cost/call data.
 /// Skips classification, tool extraction, user messages, session grouping,
 /// and all breakdown building. Uses mmap, simd-json pre-filtering, persistent
 /// SQLite cache, and flat parallelism across all files.

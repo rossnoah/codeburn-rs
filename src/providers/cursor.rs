@@ -106,7 +106,7 @@ pub fn run_background_refresh() {
     };
 
     // Skip if someone else already populated a fresh cache while we were
-    // starting up (e.g. two codeburn invocations in quick succession).
+    // starting up (e.g. two cburn invocations in quick succession).
     let (cached_opt, _) = load_cursor_cache(&db_path_str);
     if let Some(cached) = cached_opt {
         if cached.db_mtime == db_mtime {

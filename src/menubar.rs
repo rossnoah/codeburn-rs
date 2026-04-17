@@ -24,19 +24,19 @@ fn get_plugin_dir() -> PathBuf {
 }
 
 fn get_plugin_path() -> PathBuf {
-    get_plugin_dir().join("codeburn-status.5m.sh")
+    get_plugin_dir().join("cburn-status.5m.sh")
 }
 
-fn find_codeburn_binary() -> String {
-    // Try to find the codeburn binary in PATH
+fn find_cburn_binary() -> String {
+    // Try to find the cburn binary in PATH
     let output = std::process::Command::new("which")
-        .arg("codeburn")
+        .arg("cburn")
         .output();
     match output {
         Ok(o) if o.status.success() => {
             String::from_utf8_lossy(&o.stdout).trim().to_string()
         }
-        _ => "codeburn".to_string(),
+        _ => "cburn".to_string(),
     }
 }
 
@@ -50,7 +50,7 @@ pub fn install() -> Result<()> {
         );
     }
 
-    let binary = find_codeburn_binary();
+    let binary = find_cburn_binary();
     let script = format!(
         "#!/bin/bash\n{} status --format menubar\n",
         binary

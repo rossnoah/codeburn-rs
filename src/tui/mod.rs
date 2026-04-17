@@ -763,8 +763,8 @@ pub fn run(period: Period, provider: &str, refresh: Option<u64>) -> Result<()> {
 }
 
 /// One-shot rich render to stdout (no alt screen, no raw mode).
-/// Used when stdin is redirected — `codeburn report < /dev/null` from a
-/// shell, or piped output like `codeburn report | head` — to dump the
+/// Used when stdin is redirected — `cburn report < /dev/null` from a
+/// shell, or piped output like `cburn report | head` — to dump the
 /// full ratatui dashboard inline. Matches the npx `codeburn report`
 /// behaviour so the two implementations can be diff-compared.
 ///

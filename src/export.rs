@@ -158,7 +158,7 @@ pub async fn run_export(format: ExportFormat, output: Option<String>, provider: 
     }
 
     let default_name = format!(
-        "codeburn-{}",
+        "cburn-{}",
         chrono::Local::now().format("%Y-%m-%d")
     );
     let ext = match format {

@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "codeburn",
+    name = "cburn",
     about = "See where your AI coding tokens go - by task, tool, model, and project",
     version
 )]
@@ -103,7 +103,7 @@ pub enum Commands {
         provider: String,
     },
 
-    /// Set display currency (e.g. codeburn currency GBP)
+    /// Set display currency (e.g. cburn currency GBP)
     Currency {
         /// ISO 4217 currency code
         code: Option<String>,
