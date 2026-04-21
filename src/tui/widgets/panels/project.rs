@@ -24,6 +24,8 @@ use super::super::bar::make_bar;
 use super::super::panel::{column_header, panel};
 use super::super::theme::{COL_COST, COL_PROJECT};
 
+const MAX_PATH_COMPONENTS: usize = 3;
+
 fn shorten_project(path: &str) -> String {
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
@@ -33,14 +35,20 @@ fn shorten_project(path: &str) -> String {
     } else {
         path
     };
-    stripped.trim_start_matches('/').to_string()
+    let cleaned = stripped.trim_start_matches('/');
+    let parts: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= MAX_PATH_COMPONENTS {
+        parts.join("/")
+    } else {
+        parts[parts.len() - MAX_PATH_COMPONENTS..].join("/")
+    }
 }
 
 pub fn render(buf: &mut Buffer, area: Rect, bw: u16, projects: &[ProjectSummary]) {
     let max_cost = projects.iter().map(|p| p.total_cost_usd).fold(0.0f64, f64::max);
     let inner = area.width.saturating_sub(4) as usize;
-    const COL_COST_W: usize = 8;
-    const COL_AVG_W: usize = 7;
+    const COL_COST_W: usize = 10;
+    const COL_AVG_W: usize = 8;
     const COL_SESS_W: usize = 6;
     let name_width = inner
         .saturating_sub(bw as usize + 1 + COL_COST_W + COL_AVG_W + COL_SESS_W)
