@@ -72,7 +72,7 @@ const MAGIC: &[u8; 8] = b"CODEBRN1";
 // Cuts the hot path by skipping bincode-deserialise of ~100 MB of per-call
 // Strings + classify_turn for ~20k turns on every run. Old v5 caches hold
 // raw-call blobs whose shape no longer matches, so we have to reject them.
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 
 fn cache_path() -> PathBuf {
     dirs::home_dir()

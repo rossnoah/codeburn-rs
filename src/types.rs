@@ -28,6 +28,15 @@ pub struct DailyCostEntry {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    /// Per-day breakdown so date-range filtering produces accurate counts.
+    #[serde(default)]
+    pub tool_breakdown: HashMap<String, u64>,
+    #[serde(default)]
+    pub bash_breakdown: HashMap<String, u64>,
+    #[serde(default)]
+    pub mcp_breakdown: HashMap<String, u64>,
+    #[serde(default)]
+    pub model_breakdown: HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

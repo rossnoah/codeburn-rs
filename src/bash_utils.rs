@@ -21,6 +21,7 @@ use std::sync::LazyLock;
 static QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""[^"]*"|'[^']*'"#).unwrap());
 static SEPARATOR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s*(?:&&|;|\|)\s*").unwrap());
+static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w+=").unwrap());
 
 fn strip_quoted_strings(command: &str) -> String {
     QUOTE_RE
@@ -56,13 +57,18 @@ pub fn extract_bash_commands(command: &str) -> Vec<String> {
         if segment.is_empty() {
             continue;
         }
-        let first_token = segment.split_whitespace().next().unwrap_or("");
+        // Skip leading environment variable assignments (e.g. FOO=bar node script.js)
+        let first_token = segment
+            .split_whitespace()
+            .skip_while(|t| ENV_VAR_RE.is_match(t))
+            .next()
+            .unwrap_or("");
         let base = Path::new(first_token)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
 
-        if !base.is_empty() && base != "cd" {
+        if !base.is_empty() && base != "cd" && base != "true" && base != "false" {
             commands.push(base.to_string());
         }
     }
@@ -135,6 +141,34 @@ mod tests {
         assert_eq!(
             extract_bash_commands("git log --oneline | head -5 | wc -l"),
             vec!["git", "head", "wc"]
+        );
+    }
+
+    #[test]
+    fn test_env_var_prefix() {
+        assert_eq!(
+            extract_bash_commands("NODE_ENV=production npm run build"),
+            vec!["npm"]
+        );
+    }
+
+    #[test]
+    fn test_multiple_env_var_prefixes() {
+        assert_eq!(
+            extract_bash_commands("FOO=bar BAZ=qux node script.js"),
+            vec!["node"]
+        );
+    }
+
+    #[test]
+    fn test_true_false_filtered() {
+        assert_eq!(
+            extract_bash_commands("true && ls"),
+            vec!["ls"]
+        );
+        assert_eq!(
+            extract_bash_commands("false; echo done"),
+            vec!["echo"]
         );
     }
 }

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::time::{Instant, SystemTime};
 
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use dashmap::DashSet;
 use rayon::prelude::*;
 
@@ -307,13 +307,14 @@ fn build_session_summary(
             total_cache_write += call.usage.cache_creation_input_tokens;
             api_calls += 1;
 
-            // Accumulate daily costs
+            // Accumulate daily costs and breakdowns (bucket by local date to
+            // match the JS version's `dateKey` which uses local time).
             if call.timestamp.len() >= 10 {
-                let day = &call.timestamp[..10];
+                let day = utc_ts_to_local_day(&call.timestamp);
                 let daily = daily_map
-                    .entry(day.to_string())
+                    .entry(day.clone())
                     .or_insert_with(|| crate::types::DailyCostEntry {
-                        day: day.to_string(),
+                        day,
                         ..Default::default()
                     });
                 daily.cost_usd += call.cost_usd;
@@ -322,6 +323,19 @@ fn build_session_summary(
                 daily.output_tokens += call.usage.output_tokens;
                 daily.cache_read_tokens += call.usage.cache_read_input_tokens;
                 daily.cache_write_tokens += call.usage.cache_creation_input_tokens;
+
+                for tool in call.tools.iter().filter(|t| !t.starts_with("mcp__")) {
+                    *daily.tool_breakdown.entry(tool.clone()).or_default() += 1;
+                }
+                for mcp in &call.mcp_tools {
+                    let server = mcp.split("__").nth(1).unwrap_or(mcp);
+                    *daily.mcp_breakdown.entry(server.to_string()).or_default() += 1;
+                }
+                for cmd in &call.bash_commands {
+                    *daily.bash_breakdown.entry(cmd.clone()).or_default() += 1;
+                }
+                let model_key = get_short_model_name(&call.model);
+                *daily.model_breakdown.entry(model_key.clone()).or_default() += 1;
             }
 
             let model_key = get_short_model_name(&call.model);
@@ -663,13 +677,7 @@ fn build_source_summaries(
 /// Trim a cached `SessionSummary` down to the calls that fall within
 /// `date_range`. The returned summary has:
 /// - `daily_costs` restricted to in-range UTC days.
-/// - totals derived from those filtered days (cost / tokens / call count).
-/// Session-level breakdowns (`model_breakdown`, `tool_breakdown`,
-/// `bash_breakdown`, `mcp_breakdown`, `category_breakdown`) are carried
-/// through unchanged — for sessions that straddle the period boundary this
-/// can include contributions from out-of-range calls. In practice sessions
-/// are short-lived so the overlap is tiny; the dashboard totals (which come
-/// from the filtered daily_costs) stay exact.
+/// - totals and breakdowns rebuilt from those filtered days.
 ///
 /// Returns `None` when no day of the session falls in range. Consumes `s`
 /// so the HashMap breakdowns can be moved (not cloned) into the output.
@@ -678,15 +686,20 @@ fn filter_session_for_range(
     start_day: &str,
     end_day: &str,
 ) -> Option<SessionSummary> {
-    // Quick path: whole session is outside the range. `first_timestamp` /
-    // `last_timestamp` are UTC 19-char prefixes; start/end are UTC "YYYY-MM-DD"
-    // days extracted from the caller's range.
-    if !s.last_timestamp.is_empty() && s.last_timestamp.as_str() < start_day {
-        return None;
+    // Quick path: whole session is outside the range. Convert the UTC
+    // timestamps to local day strings so the comparison is consistent with
+    // the local-date daily bucketing.
+    if !s.last_timestamp.is_empty() {
+        let last_day = utc_ts_to_local_day(&s.last_timestamp);
+        if last_day.as_str() < start_day {
+            return None;
+        }
     }
-    let end_upper = end_day_upper_bound(end_day);
-    if !s.first_timestamp.is_empty() && s.first_timestamp.as_str() > end_upper.as_str() {
-        return None;
+    if !s.first_timestamp.is_empty() {
+        let first_day = utc_ts_to_local_day(&s.first_timestamp);
+        if first_day.as_str() > end_day {
+            return None;
+        }
     }
 
     // Retain in-range days in place; bail if none match so we skip the move
@@ -704,6 +717,14 @@ fn filter_session_for_range(
     let mut total_output = 0u64;
     let mut total_cache_read = 0u64;
     let mut total_cache_write = 0u64;
+
+    // Rebuild breakdowns from the filtered daily entries so sessions that
+    // straddle the period boundary only count in-range calls.
+    let mut tool_bd: HashMap<String, ToolStats> = HashMap::new();
+    let mut bash_bd: HashMap<String, ToolStats> = HashMap::new();
+    let mut mcp_bd: HashMap<String, ToolStats> = HashMap::new();
+    let mut model_bd: HashMap<String, ModelStats> = HashMap::new();
+
     for d in &s.daily_costs {
         total_cost += d.cost_usd;
         api_calls += d.call_count;
@@ -711,6 +732,19 @@ fn filter_session_for_range(
         total_output += d.output_tokens;
         total_cache_read += d.cache_read_tokens;
         total_cache_write += d.cache_write_tokens;
+
+        for (tool, &count) in &d.tool_breakdown {
+            tool_bd.entry(tool.clone()).or_insert_with(ToolStats::default).calls += count;
+        }
+        for (cmd, &count) in &d.bash_breakdown {
+            bash_bd.entry(cmd.clone()).or_insert_with(ToolStats::default).calls += count;
+        }
+        for (server, &count) in &d.mcp_breakdown {
+            mcp_bd.entry(server.clone()).or_insert_with(ToolStats::default).calls += count;
+        }
+        for (model, &count) in &d.model_breakdown {
+            model_bd.entry(model.clone()).or_insert_with(ModelStats::default).calls += count;
+        }
     }
     if api_calls == 0 {
         return None;
@@ -722,19 +756,44 @@ fn filter_session_for_range(
     s.total_output_tokens = total_output;
     s.total_cache_read_tokens = total_cache_read;
     s.total_cache_write_tokens = total_cache_write;
+
+    // Only overwrite breakdowns if per-day data is available (cache entries
+    // written before this change will have empty daily breakdowns — fall back
+    // to the session-level breakdown for those).
+    if !tool_bd.is_empty() {
+        s.tool_breakdown = tool_bd;
+    }
+    if !bash_bd.is_empty() {
+        s.bash_breakdown = bash_bd;
+    }
+    if !mcp_bd.is_empty() {
+        s.mcp_breakdown = mcp_bd;
+    }
+    if !model_bd.is_empty() {
+        s.model_breakdown = model_bd;
+    }
+
     Some(s)
 }
 
-/// `end_day` is a "YYYY-MM-DD" string — to compare against a 19-char timestamp
-/// prefix we need "YYYY-MM-DDT23:59:59" (or anything lexically >= the max
-/// in-day prefix). Returning "YYYY-MM-DDZ" works since 'Z' > 'T' > digits so
-/// any in-day ts prefix sorts below it.
-fn end_day_upper_bound(end_day: &str) -> String {
-    // "2026-04-17" → "2026-04-17Z"  (Z sorts above any "T…" suffix)
-    let mut s = String::with_capacity(end_day.len() + 1);
-    s.push_str(end_day);
-    s.push('Z');
-    s
+/// Convert a UTC ISO-8601 timestamp (e.g. "2026-04-14T17:30:00Z") to a local
+/// date string "YYYY-MM-DD". This matches the JS `dateKey` function which uses
+/// `new Date(iso).getDate()` (local time).  Falls back to the first 10 chars
+/// of the input (UTC date) if parsing fails.
+fn utc_ts_to_local_day(ts: &str) -> String {
+    // Try full ISO parse first (handles "…Z" and "+00:00" suffixes)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return dt.with_timezone(&Local).format("%Y-%m-%d").to_string();
+    }
+    // Try the common "YYYY-MM-DDTHH:MM:SS" without offset (assume UTC)
+    if ts.len() >= 19 {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(&ts[..19], "%Y-%m-%dT%H:%M:%S") {
+            let utc = chrono::Utc.from_utc_datetime(&naive);
+            return utc.with_timezone(&Local).format("%Y-%m-%d").to_string();
+        }
+    }
+    // Fallback: first 10 chars (UTC date)
+    ts.get(..10).unwrap_or(ts).to_string()
 }
 
 /// Group cached session summaries (and fresh miss summaries) by project,
@@ -746,16 +805,12 @@ fn merge_and_filter_sessions(
     miss_sessions: Vec<(String, Vec<SessionSummary>)>,
     date_range: Option<&DateRange>,
 ) -> HashMap<String, Vec<SessionSummary>> {
+    // Use local dates to match the local-time daily bucketing in
+    // build_session_summary and the JS version's dateKey / getDateRange.
     let (start_day, end_day) = match date_range {
         Some(dr) => (
-            dr.start
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d")
-                .to_string(),
-            dr.end
-                .with_timezone(&chrono::Utc)
-                .format("%Y-%m-%d")
-                .to_string(),
+            dr.start.format("%Y-%m-%d").to_string(),
+            dr.end.format("%Y-%m-%d").to_string(),
         ),
         None => (String::new(), String::new()),
     };

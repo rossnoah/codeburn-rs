@@ -187,7 +187,7 @@ pub fn get_date_range(period: &str) -> Option<DateRange> {
             .unwrap()
             .and_local_timezone(Local)
             .unwrap(),
-        "30days" => (now - chrono::Duration::days(30))
+        "30days" => (now - chrono::Duration::days(29))
             .date_naive()
             .and_hms_opt(0, 0, 0)
             .unwrap()
