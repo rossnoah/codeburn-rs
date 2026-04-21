@@ -25,11 +25,7 @@ pub fn make_bar(value: f64, max_value: f64, width: u16) -> Vec<Span<'static>> {
     let filled = (ratio * width as f64).round() as usize;
     let mut spans = Vec::new();
     for i in 0..filled {
-        let pct = if filled > 1 {
-            i as f64 / (filled - 1) as f64
-        } else {
-            0.5
-        };
+        let pct = i as f64 / width as f64;
         spans.push(Span::styled(
             "\u{2588}",
             Style::default().fg(gradient_color(pct)),
