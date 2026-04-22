@@ -1,6 +1,6 @@
 [package]
 name = "cburn"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 description = "A fast Rust rewrite of codeburn - ai token usage analysis with a TUI."
