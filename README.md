@@ -1,3 +1,8 @@
+## Archived
+
+This project is no longer maintained.
+
+
 <h1 align="center">codeburn-rs</h1>
 
 <p align="center">See where your AI coding tokens go — <b>600× faster</b></p>
